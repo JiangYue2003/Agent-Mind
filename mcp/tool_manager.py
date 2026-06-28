@@ -307,7 +307,7 @@ class MCPToolManager:
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
+                    key = self._dedup_key(item)
                     if key not in seen:
                         seen.add(key)
                         merged.append(item)
@@ -356,6 +356,24 @@ class MCPToolManager:
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
             return items[:top_k]
+
+    @staticmethod
+    def _dedup_key(item: Any) -> str:
+        if isinstance(item, dict):
+            parent_id = item.get("parent_id")
+            if parent_id:
+                return f"parent:{parent_id}"
+
+            doc_id = item.get("doc_id")
+            chunk = item.get("chunk")
+            if doc_id and chunk is not None:
+                return f"doc_chunk:{doc_id}:{chunk}"
+
+            content = item.get("content")
+            if content:
+                return f"content:{hashlib.md5(str(content).encode()).hexdigest()}"
+
+        return f"fallback:{hashlib.md5(str(item).encode()).hexdigest()}"
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 
