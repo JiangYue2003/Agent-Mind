@@ -31,6 +31,8 @@ class KnowledgeBase:
     """
 
     COLLECTION_NAME = "knowledge_base"
+    PARENT_COLLECTION_NAME = "knowledge_base_parent"
+    CHILD_COLLECTION_NAME = "knowledge_base_child"
 
     def __init__(
         self,
@@ -54,13 +56,19 @@ class KnowledgeBase:
 
         # 使用服务端时不传 embedding_function，让服务端处理
         # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
+        self._parent_collection = self._client.get_or_create_collection(
+            name=self.PARENT_COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库"},
         )
+        self._child_collection = self._client.get_or_create_collection(
+            name=self.CHILD_COLLECTION_NAME,
+            metadata={"description": "EchoMind RAG 知识库子块索引"},
+        )
+        # 兼容旧调用和旧测试桩
+        self._collection = self._child_collection
 
         # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
+        if self._child_collection.count() == 0:
             self._load_default_docs()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
@@ -72,34 +80,52 @@ class KnowledgeBase:
         documents 格式: [{"title": "...", "content": "..."}, ...]
         长文档会自动切片（每片 500 字）。
         """
-        ids, docs, metas = [], [], []
+        parent_ids, parent_docs, parent_metas = [], [], []
+        child_ids, child_docs, child_metas = [], [], []
 
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
-            chunks  = self._build_structured_chunks(title, content)
+            parent_chunks = self._build_structured_chunks(title, content)
+            child_chunks = self._build_child_chunks(parent_chunks)
 
-            for chunk in chunks:
-                doc_id = hashlib.md5(
-                    f"{chunk['doc_id']}_{chunk['chunk_index']}_{chunk['content'][:50]}".encode()
-                ).hexdigest()
-                ids.append(doc_id)
-                docs.append(chunk["content"])
-                metas.append({
+            for chunk in parent_chunks:
+                parent_ids.append(chunk["parent_id"])
+                parent_docs.append(chunk["content"])
+                parent_metas.append({
                     "title": chunk["title"],
                     "doc_id": chunk["doc_id"],
+                    "parent_id": chunk["parent_id"],
                     "section_title": chunk["section_title"],
                     "heading_path": chunk["heading_path"],
                     "chunk_index": chunk["chunk_index"],
                     "total_chunks": chunk["total_chunks"],
                 })
 
-        if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
-            logger.info(f"知识库导入 {len(ids)} 个文档片段")
+            for chunk in child_chunks:
+                child_id = hashlib.md5(
+                    f"{chunk['parent_id']}_{chunk['child_chunk_index']}_{chunk['content'][:50]}".encode()
+                ).hexdigest()
+                child_ids.append(child_id)
+                child_docs.append(chunk["content"])
+                child_metas.append({
+                    "title": chunk["title"],
+                    "doc_id": chunk["doc_id"],
+                    "parent_id": chunk["parent_id"],
+                    "section_title": chunk["section_title"],
+                    "heading_path": chunk["heading_path"],
+                    "chunk_index": chunk["chunk_index"],
+                    "child_chunk_index": chunk["child_chunk_index"],
+                    "total_chunks": chunk["total_chunks"],
+                })
 
-        return len(ids)
+        if parent_ids:
+            self._parent_collection.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
+        if child_ids:
+            self._child_collection.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
+            logger.info(f"知识库导入 {len(parent_ids)} 个父块和 {len(child_ids)} 个子块")
+
+        return len(parent_ids) + len(child_ids)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -107,33 +133,85 @@ class KnowledgeBase:
 
         ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
         """
-        results = self._collection.query(
+        child_collection = getattr(self, "_child_collection", self._collection)
+        parent_collection = getattr(self, "_parent_collection", None)
+
+        results = child_collection.query(
             query_texts=[query],
-            n_results=top_k,
+            n_results=max(top_k, 5),
         )
 
         items = []
         if results["documents"] and results["documents"][0]:
+            parent_hits: Dict[str, Dict[str, Any]] = {}
             for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
-                items.append({
-                    "title":    meta.get("title", ""),
-                    "content":  doc,
-                    "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
-                    "chunk":    meta.get("chunk_index", 0),
-                    "doc_id": meta.get("doc_id", ""),
-                    "section_title": meta.get("section_title", meta.get("title", "")),
-                    "heading_path": meta.get("heading_path", meta.get("title", "")),
-                })
+                parent_id = meta.get("parent_id")
+                score = round(1.0 - dist, 4)
+                if parent_id and parent_id not in parent_hits:
+                    parent_hits[parent_id] = {
+                        "score": score,
+                        "matched_child_content": doc,
+                        "matched_child_chunk": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
+                        "child_meta": meta,
+                    }
+                elif parent_id and score > parent_hits[parent_id]["score"]:
+                    parent_hits[parent_id].update({
+                        "score": score,
+                        "matched_child_content": doc,
+                        "matched_child_chunk": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
+                        "child_meta": meta,
+                    })
+                elif not parent_id:
+                    items.append({
+                        "title": meta.get("title", ""),
+                        "content": doc,
+                        "score": score,
+                        "chunk": meta.get("chunk_index", 0),
+                        "doc_id": meta.get("doc_id", ""),
+                        "section_title": meta.get("section_title", meta.get("title", "")),
+                        "heading_path": meta.get("heading_path", meta.get("title", "")),
+                    })
 
-        return items
+            if parent_hits and parent_collection is not None:
+                parent_results = parent_collection.get(ids=list(parent_hits.keys()))
+                parent_docs = parent_results.get("documents", [])
+                parent_metas = parent_results.get("metadatas", [])
+                parent_ids = parent_results.get("ids", [])
+
+                normalized_docs = self._flatten_result_rows(parent_docs)
+                normalized_metas = self._flatten_result_rows(parent_metas)
+                normalized_ids = self._flatten_result_rows(parent_ids)
+
+                for parent_id, doc, meta in zip(normalized_ids, normalized_docs, normalized_metas):
+                    hit = parent_hits.get(parent_id)
+                    if hit is None:
+                        continue
+                    items.append({
+                        "title": meta.get("title", ""),
+                        "content": doc,
+                        "score": hit["score"],
+                        "chunk": meta.get("chunk_index", 0),
+                        "doc_id": meta.get("doc_id", ""),
+                        "section_title": meta.get("section_title", meta.get("title", "")),
+                        "heading_path": meta.get("heading_path", meta.get("title", "")),
+                        "matched_child_content": hit["matched_child_content"],
+                        "matched_child_chunk": hit["matched_child_chunk"],
+                    })
+
+        items.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return items[:top_k]
 
     @property
     def doc_count(self) -> int:
-        return self._collection.count()
+        parent_collection = getattr(self, "_parent_collection", None)
+        child_collection = getattr(self, "_child_collection", self._collection)
+        parent_count = parent_collection.count() if parent_collection is not None else 0
+        child_count = child_collection.count() if child_collection is not None else 0
+        return parent_count + child_count
 
     # ── MCP 工具 handler ─────────────────────────────────────────────────────
 
@@ -196,8 +274,10 @@ class KnowledgeBase:
         for section in sections:
             section_chunks = self._chunk_text(section["content"])
             for chunk in section_chunks:
+                chunk_index = len(chunks)
                 chunks.append({
                     "doc_id": doc_id,
+                    "parent_id": f"{doc_id}:parent:{chunk_index}",
                     "title": title,
                     "section_title": section["section_title"],
                     "heading_path": section["heading_path"],
@@ -209,6 +289,24 @@ class KnowledgeBase:
             chunk["chunk_index"] = idx
             chunk["total_chunks"] = total
         return chunks
+
+    def _build_child_chunks(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        child_chunks: List[Dict[str, Any]] = []
+        for parent in parent_chunks:
+            pieces = self._chunk_text(parent["content"], chunk_size=180, overlap=40)
+            for child_idx, piece in enumerate(pieces):
+                child_chunks.append({
+                    "doc_id": parent["doc_id"],
+                    "parent_id": parent["parent_id"],
+                    "title": parent["title"],
+                    "section_title": parent["section_title"],
+                    "heading_path": parent["heading_path"],
+                    "chunk_index": parent["chunk_index"],
+                    "total_chunks": parent["total_chunks"],
+                    "child_chunk_index": child_idx,
+                    "content": piece,
+                })
+        return child_chunks
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -348,6 +446,14 @@ class KnowledgeBase:
             else:
                 merged.append(chunk)
         return merged
+
+    @staticmethod
+    def _flatten_result_rows(rows: Any) -> List[Any]:
+        if not isinstance(rows, list):
+            return []
+        if rows and isinstance(rows[0], list):
+            return rows[0]
+        return rows
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（客服场景常见问题）。"""

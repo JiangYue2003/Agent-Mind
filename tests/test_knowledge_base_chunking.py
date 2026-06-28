@@ -104,6 +104,93 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
         self.assertEqual(items[0]["section_title"], "审核规则")
         self.assertEqual(items[0]["heading_path"], "退款政策 > 审核规则")
 
+    def test_search_uses_child_hits_to_fetch_parent_chunks(self):
+        class FakeChildCollection:
+            def query(self, query_texts, n_results):
+                return {
+                    "documents": [[
+                        "到账需要多久",
+                        "多久到账的审核规则",
+                    ]],
+                    "metadatas": [[
+                        {
+                            "title": "退款政策",
+                            "doc_id": "doc-1",
+                            "parent_id": "parent-1",
+                            "chunk_index": 0,
+                            "section_title": "到账时效",
+                            "heading_path": "退款政策 > 到账时效",
+                            "child_chunk_index": 0,
+                        },
+                        {
+                            "title": "退款政策",
+                            "doc_id": "doc-1",
+                            "parent_id": "parent-1",
+                            "chunk_index": 1,
+                            "section_title": "到账时效",
+                            "heading_path": "退款政策 > 到账时效",
+                            "child_chunk_index": 1,
+                        },
+                    ]],
+                    "distances": [[0.05, 0.08]],
+                }
+
+        class FakeParentCollection:
+            def get(self, ids):
+                return {
+                    "ids": ["parent-1"],
+                    "documents": [["退款将在审核通过后 5-7 个工作日内退回原账户。"]],
+                    "metadatas": [[{
+                        "title": "退款政策",
+                        "doc_id": "doc-1",
+                        "parent_id": "parent-1",
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "section_title": "到账时效",
+                        "heading_path": "退款政策 > 到账时效",
+                    }]],
+                }
+
+        self.kb._collection = FakeChildCollection()
+        self.kb._parent_collection = FakeParentCollection()
+        self.kb._child_collection = FakeChildCollection()
+
+        items = self.kb.search("退款多久到账", top_k=2)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["content"], "退款将在审核通过后 5-7 个工作日内退回原账户。")
+        self.assertEqual(items[0]["matched_child_chunk"], 0)
+        self.assertEqual(items[0]["matched_child_content"], "到账需要多久")
+
+    def test_add_documents_writes_parent_and_child_collections(self):
+        class RecordingCollection:
+            def __init__(self):
+                self.calls = []
+
+            def add(self, ids, documents, metadatas):
+                self.calls.append({
+                    "ids": ids,
+                    "documents": documents,
+                    "metadatas": metadatas,
+                })
+
+            def count(self):
+                return sum(len(call["ids"]) for call in self.calls)
+
+        self.kb._parent_collection = RecordingCollection()
+        self.kb._child_collection = RecordingCollection()
+        self.kb._collection = self.kb._child_collection
+
+        added = self.kb.add_documents([{
+            "title": "退款政策",
+            "content": "# 退款政策\n退款总则说明。\n\n## 到账时效\n退款将在审核通过后 5-7 个工作日内退回原账户。",
+        }])
+
+        self.assertGreaterEqual(added, 3)
+        self.assertEqual(len(self.kb._parent_collection.calls), 1)
+        self.assertEqual(len(self.kb._child_collection.calls), 1)
+        self.assertTrue(all("parent_id" in meta for meta in self.kb._child_collection.calls[0]["metadatas"]))
+
 
 if __name__ == "__main__":
     unittest.main()
