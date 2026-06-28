@@ -77,13 +77,22 @@ class KnowledgeBase:
         for doc in documents:
             title   = doc.get("title", "")
             content = doc.get("content", "")
-            chunks  = self._chunk_text(content, chunk_size=500)
+            chunks  = self._build_structured_chunks(title, content)
 
-            for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+            for chunk in chunks:
+                doc_id = hashlib.md5(
+                    f"{chunk['doc_id']}_{chunk['chunk_index']}_{chunk['content'][:50]}".encode()
+                ).hexdigest()
                 ids.append(doc_id)
-                docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                docs.append(chunk["content"])
+                metas.append({
+                    "title": chunk["title"],
+                    "doc_id": chunk["doc_id"],
+                    "section_title": chunk["section_title"],
+                    "heading_path": chunk["heading_path"],
+                    "chunk_index": chunk["chunk_index"],
+                    "total_chunks": chunk["total_chunks"],
+                })
 
         if ids:
             # ChromaDB 会自动生成 Embedding
@@ -115,6 +124,9 @@ class KnowledgeBase:
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    "doc_id": meta.get("doc_id", ""),
+                    "section_title": meta.get("section_title", meta.get("title", "")),
+                    "heading_path": meta.get("heading_path", meta.get("title", "")),
                 })
 
         return items
@@ -172,9 +184,93 @@ class KnowledgeBase:
 
         return self._apply_overlap(base_chunks, overlap)
 
+    def _build_structured_chunks(self, title: str, content: str) -> List[Dict[str, Any]]:
+        normalized = self._normalize_text(content)
+        if not normalized:
+            return []
+
+        doc_id = hashlib.md5(f"{title}:{normalized[:200]}".encode()).hexdigest()
+        sections = self._split_sections(title, normalized)
+        chunks: List[Dict[str, Any]] = []
+
+        for section in sections:
+            section_chunks = self._chunk_text(section["content"])
+            for chunk in section_chunks:
+                chunks.append({
+                    "doc_id": doc_id,
+                    "title": title,
+                    "section_title": section["section_title"],
+                    "heading_path": section["heading_path"],
+                    "content": chunk,
+                })
+
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks):
+            chunk["chunk_index"] = idx
+            chunk["total_chunks"] = total
+        return chunks
+
     @staticmethod
     def _normalize_text(text: str) -> str:
         return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _split_sections(self, title: str, text: str) -> List[Dict[str, str]]:
+        sections: List[Dict[str, str]] = []
+        current_heading = title.strip() or "未命名文档"
+        current_path = current_heading
+        current_lines: List[str] = []
+
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                current_lines.append("")
+                continue
+
+            heading = self._extract_heading(line)
+            if heading:
+                if current_lines and any(part.strip() for part in current_lines):
+                    sections.append({
+                        "section_title": current_heading,
+                        "heading_path": current_path,
+                        "content": "\n".join(current_lines).strip(),
+                    })
+                    current_lines = []
+
+                current_heading = heading
+                current_path = heading if heading == title.strip() else f"{title.strip() or '未命名文档'} > {heading}"
+                continue
+
+            current_lines.append(raw_line)
+
+        if current_lines and any(part.strip() for part in current_lines):
+            sections.append({
+                "section_title": current_heading,
+                "heading_path": current_path,
+                "content": "\n".join(current_lines).strip(),
+            })
+
+        return sections or [{
+            "section_title": title.strip() or "未命名文档",
+            "heading_path": title.strip() or "未命名文档",
+            "content": text,
+        }]
+
+    @staticmethod
+    def _extract_heading(line: str) -> Optional[str]:
+        if not line:
+            return None
+
+        markdown = re.match(r"^#{1,6}\s+(.+)$", line)
+        if markdown:
+            return markdown.group(1).strip()
+
+        if re.match(r"^(第[一二三四五六七八九十百]+[章节部分]|[一二三四五六七八九十]+、|\d+[.)、])", line):
+            return line.strip()
+
+        if line.endswith("：") and len(line) <= 30:
+            return line[:-1].strip()
+
+        return None
 
     def _split_paragraphs(self, text: str) -> List[str]:
         parts = re.split(r"\n\s*\n+", text)

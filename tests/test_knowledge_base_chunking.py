@@ -64,6 +64,46 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertTrue(chunks[1].startswith(chunks[0][-6:]))
 
+    def test_build_chunks_extracts_heading_metadata(self):
+        text = (
+            "# 退款政策\n"
+            "退款总则说明。\n\n"
+            "## 审核规则\n"
+            "审核通过后 1-3 个工作日内处理。"
+        )
+
+        chunks = self.kb._build_structured_chunks("退款政策", text)
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(chunks[0]["section_title"], "退款政策")
+        self.assertEqual(chunks[1]["section_title"], "审核规则")
+        self.assertEqual(chunks[1]["heading_path"], "退款政策 > 审核规则")
+        self.assertEqual(chunks[0]["doc_id"], chunks[1]["doc_id"])
+
+    def test_search_returns_structural_metadata(self):
+        class FakeCollection:
+            def query(self, query_texts, n_results):
+                return {
+                    "documents": [["审核通过后 1-3 个工作日内处理。"]],
+                    "metadatas": [[{
+                        "title": "退款政策",
+                        "chunk_index": 0,
+                        "total_chunks": 1,
+                        "doc_id": "doc-1",
+                        "section_title": "审核规则",
+                        "heading_path": "退款政策 > 审核规则",
+                    }]],
+                    "distances": [[0.12]],
+                }
+
+        self.kb._collection = FakeCollection()
+
+        items = self.kb.search("退款多久到账", top_k=1)
+
+        self.assertEqual(items[0]["doc_id"], "doc-1")
+        self.assertEqual(items[0]["section_title"], "审核规则")
+        self.assertEqual(items[0]["heading_path"], "退款政策 > 审核规则")
+
 
 if __name__ == "__main__":
     unittest.main()
