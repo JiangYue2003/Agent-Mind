@@ -13,6 +13,7 @@ ChromaDB 在这里的角色：
 """
 import hashlib
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import chromadb
@@ -140,30 +141,117 @@ class KnowledgeBase:
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
-    def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
-        if len(text) <= chunk_size:
-            return [text] if text.strip() else []
+    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 80) -> List[str]:
+        """段落优先切分，段落过长时按多标点句切，并在相邻块之间保留 overlap。"""
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return []
+        if len(normalized) <= chunk_size:
+            return [normalized]
 
-        chunks = []
+        paragraphs = self._split_paragraphs(normalized)
+        base_chunks: List[str] = []
         current = ""
-        # 按句子切分
-        sentences = text.replace("\n", "。").split("。")
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            if len(current) + len(sent) + 1 > chunk_size:
-                if current:
-                    chunks.append(current)
-                current = sent
-            else:
-                current = f"{current}。{sent}" if current else sent
+
+        for paragraph in paragraphs:
+            for piece in self._split_paragraph_chunk(paragraph, chunk_size):
+                if not current:
+                    current = piece
+                    continue
+
+                merged = f"{current}\n\n{piece}"
+                if len(merged) <= chunk_size:
+                    current = merged
+                    continue
+
+                base_chunks.append(current)
+                current = piece
 
         if current:
-            chunks.append(current)
+            base_chunks.append(current)
 
-        return chunks
+        return self._apply_overlap(base_chunks, overlap)
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _split_paragraphs(self, text: str) -> List[str]:
+        parts = re.split(r"\n\s*\n+", text)
+        return [part.strip() for part in parts if part.strip()]
+
+    def _split_paragraph_chunk(self, paragraph: str, chunk_size: int) -> List[str]:
+        if len(paragraph) <= chunk_size:
+            return [paragraph]
+
+        sentences = self._split_sentences(paragraph)
+        pieces: List[str] = []
+        current = ""
+
+        for sentence in sentences:
+            if len(sentence) > chunk_size:
+                if current:
+                    pieces.append(current)
+                    current = ""
+                pieces.extend(self._hard_split(sentence, chunk_size))
+                continue
+
+            if not current:
+                current = sentence
+                continue
+
+            separator = self._sentence_separator(current, sentence)
+            candidate = f"{current}{separator}{sentence}"
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                pieces.append(current)
+                current = sentence
+
+        if current:
+            pieces.append(current)
+
+        return pieces
+
+    def _split_sentences(self, paragraph: str) -> List[str]:
+        parts = re.split(r"([。！？!?；;.])", paragraph)
+        sentences: List[str] = []
+        for i in range(0, len(parts), 2):
+            text = parts[i].strip()
+            if not text:
+                continue
+            punct = parts[i + 1] if i + 1 < len(parts) else ""
+            sentences.append(f"{text}{punct}")
+        return sentences or [paragraph]
+
+    @staticmethod
+    def _sentence_separator(current: str, sentence: str) -> str:
+        if not current or not sentence:
+            return ""
+        if current[-1] in "。！？!?；;":
+            return ""
+        return " "
+
+    def _hard_split(self, text: str, chunk_size: int) -> List[str]:
+        pieces: List[str] = []
+        remaining = text.strip()
+        while remaining:
+            pieces.append(remaining[:chunk_size].strip())
+            remaining = remaining[chunk_size:].strip()
+        return [piece for piece in pieces if piece]
+
+    def _apply_overlap(self, chunks: List[str], overlap: int) -> List[str]:
+        if overlap <= 0 or len(chunks) <= 1:
+            return chunks
+
+        merged = [chunks[0]]
+        for chunk in chunks[1:]:
+            prefix = merged[-1][-overlap:]
+            if prefix and not chunk.startswith(prefix):
+                merged.append(f"{prefix}{chunk}")
+            else:
+                merged.append(chunk)
+        return merged
 
     def _load_default_docs(self) -> None:
         """导入默认知识库文档（客服场景常见问题）。"""
