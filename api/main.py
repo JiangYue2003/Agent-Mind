@@ -365,8 +365,14 @@ async def search(query: str, top_k: int = 5):
 
 class DocInput(BaseModel):
     """单篇文档输入。"""
-    title:   str
+    title: str
     content: str
+    policy_id: Optional[str] = None
+    version_id: Optional[str] = None
+    version_no: Optional[str] = None
+    issue_code: Optional[str] = None
+    effective_at: Optional[str] = None
+    scope_key: Optional[str] = None
 
 
 class BatchDocInput(BaseModel):
@@ -416,7 +422,19 @@ async def add_knowledge(body: BatchDocInput):
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
-    count = kb.add_documents([{"title": d.title, "content": d.content} for d in body.documents])
+    count = kb.add_documents([
+        {
+            "title": d.title,
+            "content": d.content,
+            "policy_id": d.policy_id,
+            "version_id": d.version_id,
+            "version_no": d.version_no,
+            "issue_code": d.issue_code,
+            "effective_at": d.effective_at,
+            "scope_key": d.scope_key,
+        }
+        for d in body.documents
+    ])
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
 
 
