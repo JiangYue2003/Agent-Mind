@@ -295,12 +295,22 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "未命名文档"))
-            content = str(item.get("content", "")).strip()
+            content = str(item.get("matched_child_content") or item.get("content", "")).strip()
+            parent_content = str(item.get("parent_content", "")).strip()
+            heading_path = str(item.get("heading_path", title))
             score = item.get("score", "")
             if not content:
                 continue
             used = True
-            parts.append(f"{i}. 标题: {title}\n   相关度: {score}\n   内容: {content[:600]}")
+            block = [
+                f"{i}. 标题: {title}",
+                f"   相关路径: {heading_path}",
+                f"   相关度: {score}",
+                f"   命中片段: {content[:320]}",
+            ]
+            if parent_content and parent_content != content:
+                block.append(f"   所属段落: {parent_content[:420]}")
+            parts.append("\n".join(block))
 
         if not used:
             return "", False

@@ -315,7 +315,11 @@ class MCPToolManager:
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
-        # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
+        # 4. 检索工具若已完成内部精排，则直接截断返回；否则使用外层 LLM 重排
+        if all(self._looks_reranked(item) for item in merged):
+            merged.sort(key=lambda item: item.get("score", item.get("rerank_score", 0.0)), reverse=True)
+            return ToolResult(success=True, data=merged[:top_k], tool_name=tool_name, reranked=True)
+
         reranked = await self._rerank(query, merged, top_k)
         return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
 
@@ -374,6 +378,10 @@ class MCPToolManager:
                 return f"content:{hashlib.md5(str(content).encode()).hexdigest()}"
 
         return f"fallback:{hashlib.md5(str(item).encode()).hexdigest()}"
+
+    @staticmethod
+    def _looks_reranked(item: Any) -> bool:
+        return isinstance(item, dict) and "rerank_score" in item
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

@@ -13,10 +13,14 @@ ChromaDB 在这里的角色：
 """
 import hashlib
 import logging
+import math
+import os
 import re
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import chromadb
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,9 @@ class KnowledgeBase:
     COLLECTION_NAME = "knowledge_base"
     PARENT_COLLECTION_NAME = "knowledge_base_parent"
     CHILD_COLLECTION_NAME = "knowledge_base_child"
+    DEFAULT_RECALL_TOP_K = 20
+    DEFAULT_RRF_K = 60
+    DEFAULT_RERANK_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
 
     def __init__(
         self,
@@ -40,6 +47,18 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
     ):
+        self._child_records: List[Dict[str, Any]] = []
+        self._bm25_doc_tokens: List[List[str]] = []
+        self._bm25_term_freqs: List[Counter[str]] = []
+        self._bm25_doc_freq: Dict[str, int] = {}
+        self._bm25_avgdl = 0.0
+        self._hybrid_recall_k = self._read_int_env("RAG_HYBRID_RECALL_K", self.DEFAULT_RECALL_TOP_K)
+        self._rrf_k = self._read_int_env("RAG_RRF_K", self.DEFAULT_RRF_K)
+        self._rerank_url = os.getenv("DASHSCOPE_RERANK_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks").strip()
+        self._rerank_api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        self._rerank_model = os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank").strip() or "qwen3-rerank"
+        self._rerank_instruct = os.getenv("DASHSCOPE_RERANK_INSTRUCT", self.DEFAULT_RERANK_INSTRUCT).strip() or self.DEFAULT_RERANK_INSTRUCT
+
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
         self._use_server = False
         try:
@@ -70,6 +89,8 @@ class KnowledgeBase:
         # 如果知识库为空，导入默认文档
         if self._child_collection.count() == 0:
             self._load_default_docs()
+        else:
+            self._load_child_records_from_collection()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -82,6 +103,9 @@ class KnowledgeBase:
         """
         parent_ids, parent_docs, parent_metas = [], [], []
         child_ids, child_docs, child_metas = [], [], []
+        child_records: List[Dict[str, Any]] = []
+        if not hasattr(self, "_child_records"):
+            self._child_records = []
 
         for doc in documents:
             title   = doc.get("title", "")
@@ -118,92 +142,40 @@ class KnowledgeBase:
                     "child_chunk_index": chunk["child_chunk_index"],
                     "total_chunks": chunk["total_chunks"],
                 })
+                child_records.append({
+                    "title": chunk["title"],
+                    "content": chunk["content"],
+                    "doc_id": chunk["doc_id"],
+                    "parent_id": chunk["parent_id"],
+                    "section_title": chunk["section_title"],
+                    "heading_path": chunk["heading_path"],
+                    "chunk_index": chunk["chunk_index"],
+                    "child_chunk_index": chunk["child_chunk_index"],
+                    "total_chunks": chunk["total_chunks"],
+                })
 
         if parent_ids:
             self._parent_collection.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
         if child_ids:
             self._child_collection.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
             logger.info(f"知识库导入 {len(parent_ids)} 个父块和 {len(child_ids)} 个子块")
+            self._child_records.extend(child_records)
+            self._rebuild_bm25_index()
 
         return len(parent_ids) + len(child_ids)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
-        语义检索：根据 query 返回最相关的文档片段。
+        混合检索：向量召回 + BM25 召回 → RRF 融合 → qwen3-rerank 重排。
 
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
+        最终返回精确 child chunk，同时补充所属 parent 内容，便于后续上下文注入。
         """
-        child_collection = getattr(self, "_child_collection", self._collection)
-        parent_collection = getattr(self, "_parent_collection", None)
-
-        results = child_collection.query(
-            query_texts=[query],
-            n_results=max(top_k, 5),
-        )
-
-        items = []
-        if results["documents"] and results["documents"][0]:
-            parent_hits: Dict[str, Dict[str, Any]] = {}
-            for doc, meta, dist in zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            ):
-                parent_id = meta.get("parent_id")
-                score = round(1.0 - dist, 4)
-                if parent_id and parent_id not in parent_hits:
-                    parent_hits[parent_id] = {
-                        "score": score,
-                        "matched_child_content": doc,
-                        "matched_child_chunk": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
-                        "child_meta": meta,
-                    }
-                elif parent_id and score > parent_hits[parent_id]["score"]:
-                    parent_hits[parent_id].update({
-                        "score": score,
-                        "matched_child_content": doc,
-                        "matched_child_chunk": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
-                        "child_meta": meta,
-                    })
-                elif not parent_id:
-                    items.append({
-                        "title": meta.get("title", ""),
-                        "content": doc,
-                        "score": score,
-                        "chunk": meta.get("chunk_index", 0),
-                        "doc_id": meta.get("doc_id", ""),
-                        "section_title": meta.get("section_title", meta.get("title", "")),
-                        "heading_path": meta.get("heading_path", meta.get("title", "")),
-                    })
-
-            if parent_hits and parent_collection is not None:
-                parent_results = parent_collection.get(ids=list(parent_hits.keys()))
-                parent_docs = parent_results.get("documents", [])
-                parent_metas = parent_results.get("metadatas", [])
-                parent_ids = parent_results.get("ids", [])
-
-                normalized_docs = self._flatten_result_rows(parent_docs)
-                normalized_metas = self._flatten_result_rows(parent_metas)
-                normalized_ids = self._flatten_result_rows(parent_ids)
-
-                for parent_id, doc, meta in zip(normalized_ids, normalized_docs, normalized_metas):
-                    hit = parent_hits.get(parent_id)
-                    if hit is None:
-                        continue
-                    items.append({
-                        "title": meta.get("title", ""),
-                        "content": doc,
-                        "score": hit["score"],
-                        "chunk": meta.get("chunk_index", 0),
-                        "doc_id": meta.get("doc_id", ""),
-                        "section_title": meta.get("section_title", meta.get("title", "")),
-                        "heading_path": meta.get("heading_path", meta.get("title", "")),
-                        "matched_child_content": hit["matched_child_content"],
-                        "matched_child_chunk": hit["matched_child_chunk"],
-                    })
-
-        items.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-        return items[:top_k]
+        recall_k = self._resolve_recall_k(top_k)
+        vector_hits = self._vector_recall(query, top_n=recall_k)
+        bm25_hits = self._bm25_recall(query, top_n=recall_k)
+        fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=recall_k)
+        reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
+        return self._attach_parent_context(reranked)
 
     @property
     def doc_count(self) -> int:
@@ -307,6 +279,362 @@ class KnowledgeBase:
                     "content": piece,
                 })
         return child_chunks
+
+    def _resolve_recall_k(self, top_k: int) -> int:
+        baseline = max(top_k, getattr(self, "_hybrid_recall_k", self.DEFAULT_RECALL_TOP_K))
+        child_count = len(getattr(self, "_child_records", []))
+        if child_count > 0:
+            return max(top_k, min(baseline, child_count))
+        return baseline
+
+    def _vector_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
+        child_collection = getattr(self, "_child_collection", getattr(self, "_collection", None))
+        if child_collection is None:
+            return []
+
+        try:
+            results = child_collection.query(
+                query_texts=[query],
+                n_results=max(top_n, 1),
+            )
+        except Exception as ex:
+            logger.warning(f"向量召回失败: {ex}")
+            return []
+
+        docs = self._flatten_result_rows(results.get("documents", []))
+        metas = self._flatten_result_rows(results.get("metadatas", []))
+        dists = self._flatten_result_rows(results.get("distances", []))
+
+        hits: List[Dict[str, Any]] = []
+        for doc, meta, dist in zip(docs, metas, dists):
+            if not isinstance(meta, dict):
+                continue
+            score = round(1.0 - float(dist), 4)
+            hits.append(self._build_candidate_from_meta(meta, doc, vector_score=score))
+
+        hits.sort(key=lambda item: item.get("vector_score", 0.0), reverse=True)
+        return hits[:top_n]
+
+    def _bm25_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
+        self._ensure_bm25_index()
+        records = getattr(self, "_child_records", [])
+        if not records:
+            return []
+
+        query_terms = self._tokenize_for_bm25(query)
+        if not query_terms:
+            return []
+
+        avgdl = getattr(self, "_bm25_avgdl", 0.0) or 1.0
+        term_freqs = getattr(self, "_bm25_term_freqs", [])
+        doc_tokens = getattr(self, "_bm25_doc_tokens", [])
+        doc_freq = getattr(self, "_bm25_doc_freq", {})
+        total_docs = len(records)
+        scored: List[Dict[str, Any]] = []
+
+        for idx, record in enumerate(records):
+            if idx >= len(term_freqs) or idx >= len(doc_tokens):
+                continue
+            tf = term_freqs[idx]
+            doc_len = max(len(doc_tokens[idx]), 1)
+            score = 0.0
+            for term in query_terms:
+                freq = tf.get(term, 0)
+                if freq <= 0:
+                    continue
+                df = doc_freq.get(term, 0)
+                idf = math.log(1 + (total_docs - df + 0.5) / (df + 0.5))
+                numerator = freq * (1.5 + 1.0)
+                denominator = freq + 1.5 * (1 - 0.75 + 0.75 * doc_len / avgdl)
+                score += idf * (numerator / denominator)
+
+            if score <= 0:
+                continue
+
+            candidate = self._build_candidate_from_meta(record, record.get("content", ""), bm25_score=round(score, 4))
+            scored.append(candidate)
+
+        scored.sort(key=lambda item: item.get("bm25_score", 0.0), reverse=True)
+        return scored[:top_n]
+
+    def _fuse_recall_results(
+        self,
+        vector_hits: List[Dict[str, Any]],
+        bm25_hits: List[Dict[str, Any]],
+        top_n: int,
+    ) -> List[Dict[str, Any]]:
+        fused: Dict[str, Dict[str, Any]] = {}
+
+        def merge_hits(hits: List[Dict[str, Any]], source: str) -> None:
+            for rank, hit in enumerate(hits, start=1):
+                key = self._candidate_key(hit)
+                merged = fused.setdefault(key, dict(hit))
+                merged.setdefault("vector_score", 0.0)
+                merged.setdefault("bm25_score", 0.0)
+                merged.setdefault("rrf_score", 0.0)
+                merged["rrf_score"] += 1.0 / (getattr(self, "_rrf_k", self.DEFAULT_RRF_K) + rank)
+                if source == "vector":
+                    merged["vector_score"] = max(float(merged.get("vector_score", 0.0)), float(hit.get("vector_score", hit.get("score", 0.0))))
+                else:
+                    merged["bm25_score"] = max(float(merged.get("bm25_score", 0.0)), float(hit.get("bm25_score", hit.get("score", 0.0))))
+
+        merge_hits(vector_hits, "vector")
+        merge_hits(bm25_hits, "bm25")
+
+        items = list(fused.values())
+        items.sort(
+            key=lambda item: (
+                item.get("rrf_score", 0.0),
+                item.get("vector_score", 0.0),
+                item.get("bm25_score", 0.0),
+            ),
+            reverse=True,
+        )
+        for item in items:
+            item["score"] = round(float(item.get("rrf_score", 0.0)), 4)
+        return items[:top_n]
+
+    def _rerank_candidates(self, query: str, candidates: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
+        if len(candidates) <= top_n:
+            return self._apply_rerank_scores(candidates)
+
+        api_key = getattr(self, "_rerank_api_key", "").strip()
+        if not api_key:
+            return self._apply_rerank_scores(candidates[:top_n])
+
+        payload = {
+            "model": getattr(self, "_rerank_model", "qwen3-rerank"),
+            "query": query,
+            "documents": [str(item.get("content", ""))[:4000] for item in candidates],
+            "top_n": min(top_n, len(candidates)),
+            "instruct": getattr(self, "_rerank_instruct", self.DEFAULT_RERANK_INSTRUCT),
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = httpx.post(
+                getattr(self, "_rerank_url", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"),
+                headers=headers,
+                json=payload,
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            body = response.json()
+            results = body.get("results", [])
+            if not isinstance(results, list) or not results:
+                raise ValueError("rerank 响应缺少 results")
+
+            reranked: List[Dict[str, Any]] = []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                index = item.get("index")
+                if not isinstance(index, int) or not (0 <= index < len(candidates)):
+                    continue
+                updated = dict(candidates[index])
+                rerank_score = round(float(item.get("relevance_score", updated.get("score", 0.0))), 4)
+                updated["rerank_score"] = rerank_score
+                updated["score"] = rerank_score
+                reranked.append(updated)
+
+            if reranked:
+                return reranked[:top_n]
+        except Exception as ex:
+            logger.warning(f"qwen3-rerank 调用失败，回退到 RRF 排序: {ex}")
+
+        return self._apply_rerank_scores(candidates[:top_n])
+
+    def _attach_parent_context(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+
+        parent_collection = getattr(self, "_parent_collection", None)
+        if parent_collection is None:
+            return items
+
+        parent_ids = [
+            item.get("parent_id")
+            for item in items
+            if isinstance(item, dict) and item.get("parent_id")
+        ]
+        unique_parent_ids = list(dict.fromkeys(parent_ids))
+        if not unique_parent_ids:
+            return items
+
+        try:
+            parent_results = parent_collection.get(ids=unique_parent_ids)
+        except Exception as ex:
+            logger.warning(f"回捞父块失败: {ex}")
+            return items
+
+        docs = self._flatten_result_rows(parent_results.get("documents", []))
+        metas = self._flatten_result_rows(parent_results.get("metadatas", []))
+        ids = self._flatten_result_rows(parent_results.get("ids", []))
+        parent_map: Dict[str, Dict[str, Any]] = {}
+
+        for parent_id, doc, meta in zip(ids, docs, metas):
+            parent_map[str(parent_id)] = {
+                "content": doc,
+                "meta": meta if isinstance(meta, dict) else {},
+            }
+
+        enriched: List[Dict[str, Any]] = []
+        for item in items:
+            updated = dict(item)
+            parent = parent_map.get(str(updated.get("parent_id", "")))
+            if parent is not None:
+                meta = parent.get("meta", {})
+                updated["parent_content"] = parent.get("content", "")
+                updated["title"] = meta.get("title", updated.get("title", ""))
+                updated["section_title"] = meta.get("section_title", updated.get("section_title", updated.get("title", "")))
+                updated["heading_path"] = meta.get("heading_path", updated.get("heading_path", updated.get("title", "")))
+            enriched.append(updated)
+        return enriched
+
+    def _apply_rerank_scores(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ranked: List[Dict[str, Any]] = []
+        for item in items:
+            updated = dict(item)
+            if "rerank_score" not in updated:
+                updated["rerank_score"] = round(float(updated.get("rrf_score", updated.get("score", 0.0))), 4)
+            updated["score"] = updated["rerank_score"]
+            ranked.append(updated)
+        return ranked
+
+    def _build_candidate_from_meta(
+        self,
+        meta: Dict[str, Any],
+        content: str,
+        *,
+        vector_score: float = 0.0,
+        bm25_score: float = 0.0,
+    ) -> Dict[str, Any]:
+        child_chunk = meta.get("child_chunk_index", meta.get("chunk_index", 0))
+        return {
+            "title": meta.get("title", ""),
+            "content": content,
+            "score": vector_score or bm25_score,
+            "vector_score": round(vector_score, 4),
+            "bm25_score": round(bm25_score, 4),
+            "rrf_score": 0.0,
+            "chunk": meta.get("chunk_index", 0),
+            "doc_id": meta.get("doc_id", ""),
+            "parent_id": meta.get("parent_id", ""),
+            "section_title": meta.get("section_title", meta.get("title", "")),
+            "heading_path": meta.get("heading_path", meta.get("title", "")),
+            "matched_child_content": content,
+            "matched_child_chunk": child_chunk,
+        }
+
+    def _ensure_bm25_index(self) -> None:
+        if getattr(self, "_bm25_doc_tokens", None):
+            return
+        if not hasattr(self, "_child_records"):
+            self._child_records = []
+        if not getattr(self, "_child_records", None):
+            self._load_child_records_from_collection()
+        self._rebuild_bm25_index()
+
+    def _load_child_records_from_collection(self) -> None:
+        child_collection = getattr(self, "_child_collection", getattr(self, "_collection", None))
+        if child_collection is None or not hasattr(child_collection, "get"):
+            return
+
+        try:
+            results = child_collection.get(include=["documents", "metadatas"])
+        except TypeError:
+            results = child_collection.get()
+        except Exception as ex:
+            logger.warning(f"加载子块索引失败: {ex}")
+            return
+
+        docs = self._flatten_result_rows(results.get("documents", []))
+        metas = self._flatten_result_rows(results.get("metadatas", []))
+        self._child_records = []
+        for doc, meta in zip(docs, metas):
+            if not isinstance(meta, dict):
+                continue
+            self._child_records.append({
+                "title": meta.get("title", ""),
+                "content": doc,
+                "doc_id": meta.get("doc_id", ""),
+                "parent_id": meta.get("parent_id", ""),
+                "section_title": meta.get("section_title", meta.get("title", "")),
+                "heading_path": meta.get("heading_path", meta.get("title", "")),
+                "chunk_index": meta.get("chunk_index", 0),
+                "child_chunk_index": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
+                "total_chunks": meta.get("total_chunks", 1),
+            })
+        self._rebuild_bm25_index()
+
+    def _rebuild_bm25_index(self) -> None:
+        records = getattr(self, "_child_records", [])
+        self._bm25_doc_tokens = []
+        self._bm25_term_freqs = []
+        self._bm25_doc_freq = {}
+
+        total_len = 0
+        for record in records:
+            tokens = self._tokenize_for_bm25(record.get("content", ""))
+            if not tokens:
+                tokens = [record.get("content", "")]
+            self._bm25_doc_tokens.append(tokens)
+            term_freq = Counter(tokens)
+            self._bm25_term_freqs.append(term_freq)
+            total_len += len(tokens)
+            for term in term_freq.keys():
+                self._bm25_doc_freq[term] = self._bm25_doc_freq.get(term, 0) + 1
+
+        self._bm25_avgdl = (total_len / len(records)) if records else 0.0
+
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        text = self._normalize_text(text).lower()
+        if not text:
+            return []
+
+        tokens: List[str] = []
+        for part in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text):
+            if re.fullmatch(r"[a-z0-9]+", part):
+                tokens.append(part)
+                continue
+
+            chars = [char for char in part if char.strip()]
+            if len(chars) == 1:
+                tokens.extend(chars)
+                continue
+
+            tokens.append("".join(chars))
+            tokens.extend(chars)
+            tokens.extend("".join(chars[i:i + 2]) for i in range(len(chars) - 1))
+
+        return tokens
+
+    @staticmethod
+    def _candidate_key(item: Dict[str, Any]) -> str:
+        parent_id = item.get("parent_id")
+        child_chunk = item.get("matched_child_chunk", item.get("child_chunk_index", item.get("chunk", 0)))
+        if parent_id:
+            return f"{parent_id}:{child_chunk}"
+
+        doc_id = item.get("doc_id")
+        if doc_id:
+            return f"{doc_id}:{item.get('chunk', 0)}:{child_chunk}"
+
+        content = str(item.get("content", ""))
+        return hashlib.md5(content.encode()).hexdigest()
+
+    @staticmethod
+    def _read_int_env(name: str, default: int) -> int:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return default
 
     @staticmethod
     def _normalize_text(text: str) -> str:
