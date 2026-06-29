@@ -415,7 +415,7 @@ class KnowledgeBase:
             for chunk in parent_chunks:
                 parent_ids.append(chunk["parent_id"])
                 parent_docs.append(chunk["content"])
-                parent_metas.append({
+                parent_metas.append(self._sanitize_metadata({
                     "title": chunk["title"],
                     "doc_id": chunk["doc_id"],
                     "parent_id": chunk["parent_id"],
@@ -429,7 +429,7 @@ class KnowledgeBase:
                     "heading_path": chunk["heading_path"],
                     "chunk_index": chunk["chunk_index"],
                     "total_chunks": chunk["total_chunks"],
-                })
+                }))
 
             for chunk in child_chunks:
                 child_id = hashlib.md5(
@@ -437,7 +437,7 @@ class KnowledgeBase:
                 ).hexdigest()
                 child_ids.append(child_id)
                 child_docs.append(chunk["content"])
-                child_metas.append({
+                child_metas.append(self._sanitize_metadata({
                     "title": chunk["title"],
                     "doc_id": chunk["doc_id"],
                     "parent_id": chunk["parent_id"],
@@ -452,7 +452,7 @@ class KnowledgeBase:
                     "chunk_index": chunk["chunk_index"],
                     "child_chunk_index": chunk["child_chunk_index"],
                     "total_chunks": chunk["total_chunks"],
-                })
+                }))
                 child_records.append({
                     "title": chunk["title"],
                     "content": chunk["content"],
@@ -1027,6 +1027,14 @@ class KnowledgeBase:
     @staticmethod
     def _normalize_text(text: str) -> str:
         return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    @staticmethod
+    def _sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value
+            for key, value in metadata.items()
+            if isinstance(value, (str, int, float, bool))
+        }
 
     def _records_for_scope(self, scope: str) -> List[Dict[str, Any]]:
         if scope == "archive":

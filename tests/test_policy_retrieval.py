@@ -175,6 +175,23 @@ class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
         self.assertEqual(plan["scope"], "archive")
         self.assertEqual(plan["filters"]["version_ids"], ["leave-v1"])
 
+    def test_sanitize_metadata_removes_none_values_for_chroma(self):
+        kb = KnowledgeBase.__new__(KnowledgeBase)
+
+        metadata = kb._sanitize_metadata({
+            "title": "退款政策",
+            "policy_id": "policy-refund",
+            "version_id": "v1",
+            "effective_at": None,
+            "chunk_index": 0,
+            "enabled": True,
+        })
+
+        self.assertNotIn("effective_at", metadata)
+        self.assertEqual(metadata["title"], "退款政策")
+        self.assertEqual(metadata["chunk_index"], 0)
+        self.assertTrue(metadata["enabled"])
+
 
 if __name__ == "__main__":
     unittest.main()
