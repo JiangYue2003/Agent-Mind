@@ -312,6 +312,7 @@ class KnowledgeBase:
     DEFAULT_RECALL_TOP_K = 20
     DEFAULT_RRF_K = 60
     DEFAULT_RERANK_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
+    DEFAULT_RERANK_SCORE_THRESHOLD = 0.25
 
     def __init__(
         self,
@@ -335,6 +336,7 @@ class KnowledgeBase:
         self._rerank_api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
         self._rerank_model = os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank").strip() or "qwen3-rerank"
         self._rerank_instruct = os.getenv("DASHSCOPE_RERANK_INSTRUCT", self.DEFAULT_RERANK_INSTRUCT).strip() or self.DEFAULT_RERANK_INSTRUCT
+        self._rerank_score_threshold = self._read_float_env("RAG_RERANK_SCORE_THRESHOLD", self.DEFAULT_RERANK_SCORE_THRESHOLD)
         self._policy_catalog = PolicyCatalog(os.path.join(chroma_path, "policy_catalog.sqlite3"))
 
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
@@ -777,6 +779,8 @@ class KnowledgeBase:
                     continue
                 updated = dict(candidates[index])
                 rerank_score = round(float(item.get("relevance_score", updated.get("score", 0.0))), 4)
+                if rerank_score < getattr(self, "_rerank_score_threshold", self.DEFAULT_RERANK_SCORE_THRESHOLD):
+                    continue
                 updated["rerank_score"] = rerank_score
                 updated["score"] = rerank_score
                 reranked.append(updated)
@@ -1021,6 +1025,16 @@ class KnowledgeBase:
             return default
         try:
             return max(1, int(raw))
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _read_float_env(name: str, default: float) -> float:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(0.0, float(raw))
         except ValueError:
             return default
 

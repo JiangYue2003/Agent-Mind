@@ -28,6 +28,7 @@ KnowledgeBase = knowledge_base_module.KnowledgeBase
 class KnowledgeBaseChunkingTests(unittest.TestCase):
     def setUp(self):
         self.kb = KnowledgeBase.__new__(KnowledgeBase)
+        self.kb._rerank_score_threshold = KnowledgeBase.DEFAULT_RERANK_SCORE_THRESHOLD
 
     def test_prefers_paragraph_boundaries_before_sentence_split(self):
         text = (
@@ -294,6 +295,52 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
         self.assertEqual(items[0]["matched_child_chunk"], 1)
         self.assertEqual(items[0]["matched_child_content"], "审核通过后 5-7 个工作日内退款会退回原支付账户。")
         self.assertAlmostEqual(items[0]["rerank_score"], 0.97)
+
+    def test_rerank_candidates_filters_scores_below_threshold(self):
+        self.kb._rerank_api_key = "test-key"
+        self.kb._rerank_url = "https://example.com/reranks"
+        self.kb._rerank_model = "qwen3-rerank"
+        self.kb._rerank_instruct = KnowledgeBase.DEFAULT_RERANK_INSTRUCT
+
+        candidates = [
+            {"content": "退款将在 5-7 个工作日内到账。", "score": 0.03, "rrf_score": 0.03},
+            {"content": "会员积分一年后清零。", "score": 0.02, "rrf_score": 0.02},
+            {"content": "配送通常 3-5 个工作日送达。", "score": 0.01, "rrf_score": 0.01},
+        ]
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "results": [
+                        {"index": 0, "relevance_score": 0.91},
+                        {"index": 1, "relevance_score": 0.12},
+                        {"index": 2, "relevance_score": 0.08},
+                    ]
+                }
+
+        original_post = knowledge_base_module.httpx.post
+        knowledge_base_module.httpx.post = lambda *args, **kwargs: FakeResponse()
+        try:
+            items = self.kb._rerank_candidates("退款规则", candidates, top_n=2)
+        finally:
+            knowledge_base_module.httpx.post = original_post
+
+        self.assertEqual(len(items), 1)
+        self.assertAlmostEqual(items[0]["rerank_score"], 0.91)
+
+    def test_rerank_threshold_does_not_filter_rrf_fallback_results(self):
+        self.kb._rerank_api_key = ""
+
+        items = self.kb._rerank_candidates("退款规则", [
+            {"content": "退款将在 5-7 个工作日内到账。", "score": 0.03, "rrf_score": 0.03},
+            {"content": "会员积分一年后清零。", "score": 0.02, "rrf_score": 0.02},
+        ], top_n=2)
+
+        self.assertEqual(len(items), 2)
+        self.assertAlmostEqual(items[0]["rerank_score"], 0.03)
 
     def test_add_documents_writes_parent_and_child_collections(self):
         class RecordingCollection:

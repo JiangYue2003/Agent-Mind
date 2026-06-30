@@ -298,6 +298,8 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
             content = str(item.get("matched_child_content") or item.get("content", "")).strip()
             parent_content = str(item.get("parent_content", "")).strip()
             heading_path = str(item.get("heading_path", title))
+            version_no = str(item.get("version_no", "") or "").strip()
+            effective_at = str(item.get("effective_at", "") or "").strip()
             score = item.get("score", "")
             if not content:
                 continue
@@ -306,8 +308,12 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
                 f"{i}. 标题: {title}",
                 f"   相关路径: {heading_path}",
                 f"   相关度: {score}",
-                f"   命中片段: {content[:320]}",
             ]
+            if version_no:
+                block.append(f"   版本号: {version_no}")
+            if effective_at:
+                block.append(f"   生效时间: {effective_at}")
+            block.append(f"   命中片段: {content[:320]}")
             if parent_content and parent_content != content:
                 block.append(f"   所属段落: {parent_content[:420]}")
             parts.append("\n".join(block))
@@ -490,6 +496,58 @@ async def knowledge_stats():
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     return {"total_chunks": kb.doc_count}
+
+
+@app.get("/knowledge/chunks", tags=["知识库"])
+async def knowledge_chunks(scope: str = "active", limit: int = 1000, offset: int = 0):
+    """导出切分后的 child chunk 清单，供 RAG 标注与检索评测使用。"""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    kb = tool.handler.__self__
+
+    normalized_scope = (scope or "active").strip().lower()
+    if normalized_scope not in {"active", "archive"}:
+        raise HTTPException(400, "scope 仅支持 active 或 archive")
+
+    safe_limit = max(1, min(limit, 5000))
+    safe_offset = max(0, offset)
+    records = getattr(
+        kb,
+        "_archive_child_records" if normalized_scope == "archive" else "_child_records",
+        [],
+    ) or []
+
+    items = []
+    for record in records[safe_offset:safe_offset + safe_limit]:
+        if not isinstance(record, dict):
+            continue
+        parent_id = str(record.get("parent_id", "") or "")
+        child_chunk_index = int(record.get("child_chunk_index", record.get("chunk_index", 0)) or 0)
+        items.append({
+            "chunk_key": f"{parent_id}:{child_chunk_index}" if parent_id else "",
+            "title": str(record.get("title", "") or ""),
+            "doc_id": str(record.get("doc_id", "") or ""),
+            "policy_id": str(record.get("policy_id", "") or ""),
+            "version_id": str(record.get("version_id", "") or ""),
+            "version_no": str(record.get("version_no", "") or ""),
+            "issue_code": str(record.get("issue_code", "") or ""),
+            "effective_at": record.get("effective_at"),
+            "parent_id": parent_id,
+            "chunk_index": int(record.get("chunk_index", 0) or 0),
+            "child_chunk_index": child_chunk_index,
+            "heading_path": str(record.get("heading_path", "") or ""),
+            "section_title": str(record.get("section_title", "") or ""),
+            "content": str(record.get("content", "") or ""),
+        })
+
+    return {
+        "scope": normalized_scope,
+        "total": len(records),
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "items": items,
+    }
 
 
 @app.post("/eval/run")
