@@ -298,8 +298,6 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
             content = str(item.get("matched_child_content") or item.get("content", "")).strip()
             parent_content = str(item.get("parent_content", "")).strip()
             heading_path = str(item.get("heading_path", title))
-            version_no = str(item.get("version_no", "") or "").strip()
-            effective_at = str(item.get("effective_at", "") or "").strip()
             score = item.get("score", "")
             if not content:
                 continue
@@ -309,10 +307,6 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
                 f"   相关路径: {heading_path}",
                 f"   相关度: {score}",
             ]
-            if version_no:
-                block.append(f"   版本号: {version_no}")
-            if effective_at:
-                block.append(f"   生效时间: {effective_at}")
             block.append(f"   命中片段: {content[:320]}")
             if parent_content and parent_content != content:
                 block.append(f"   所属段落: {parent_content[:420]}")
@@ -358,27 +352,26 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5):
+async def search(query: str, top_k: int = 5, recall_k: Optional[int] = None):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    result = await _tool_manager.search_with_rewrite(
+        "knowledge_search",
+        query,
+        top_k=top_k,
+        recall_k=recall_k,
+    )
+    return {"query": query, "results": result.data, "reranked": result.reranked, "recall_k": recall_k}
 
 
 class DocInput(BaseModel):
     """单篇文档输入。"""
     title: str
     content: str
-    policy_id: Optional[str] = None
-    version_id: Optional[str] = None
-    version_no: Optional[str] = None
-    issue_code: Optional[str] = None
-    effective_at: Optional[str] = None
-    scope_key: Optional[str] = None
 
 
 class BatchDocInput(BaseModel):
@@ -432,12 +425,6 @@ async def add_knowledge(body: BatchDocInput):
         {
             "title": d.title,
             "content": d.content,
-            "policy_id": d.policy_id,
-            "version_id": d.version_id,
-            "version_no": d.version_no,
-            "issue_code": d.issue_code,
-            "effective_at": d.effective_at,
-            "scope_key": d.scope_key,
         }
         for d in body.documents
     ])
@@ -499,24 +486,16 @@ async def knowledge_stats():
 
 
 @app.get("/knowledge/chunks", tags=["知识库"])
-async def knowledge_chunks(scope: str = "active", limit: int = 1000, offset: int = 0):
+async def knowledge_chunks(limit: int = 1000, offset: int = 0):
     """导出切分后的 child chunk 清单，供 RAG 标注与检索评测使用。"""
     tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
     if tool is None:
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
 
-    normalized_scope = (scope or "active").strip().lower()
-    if normalized_scope not in {"active", "archive"}:
-        raise HTTPException(400, "scope 仅支持 active 或 archive")
-
     safe_limit = max(1, min(limit, 5000))
     safe_offset = max(0, offset)
-    records = getattr(
-        kb,
-        "_archive_child_records" if normalized_scope == "archive" else "_child_records",
-        [],
-    ) or []
+    records = getattr(kb, "_child_records", []) or []
 
     items = []
     for record in records[safe_offset:safe_offset + safe_limit]:
@@ -528,11 +507,6 @@ async def knowledge_chunks(scope: str = "active", limit: int = 1000, offset: int
             "chunk_key": f"{parent_id}:{child_chunk_index}" if parent_id else "",
             "title": str(record.get("title", "") or ""),
             "doc_id": str(record.get("doc_id", "") or ""),
-            "policy_id": str(record.get("policy_id", "") or ""),
-            "version_id": str(record.get("version_id", "") or ""),
-            "version_no": str(record.get("version_no", "") or ""),
-            "issue_code": str(record.get("issue_code", "") or ""),
-            "effective_at": record.get("effective_at"),
             "parent_id": parent_id,
             "chunk_index": int(record.get("chunk_index", 0) or 0),
             "child_chunk_index": child_chunk_index,
@@ -542,7 +516,7 @@ async def knowledge_chunks(scope: str = "active", limit: int = 1000, offset: int
         })
 
     return {
-        "scope": normalized_scope,
+        "scope": "active",
         "total": len(records),
         "offset": safe_offset,
         "limit": safe_limit,

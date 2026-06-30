@@ -16,7 +16,6 @@ import logging
 import math
 import os
 import re
-import sqlite3
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -25,269 +24,6 @@ import chromadb
 import httpx
 
 logger = logging.getLogger(__name__)
-
-
-class PolicyCatalog:
-    """制度目录表：维护稳定 policy_id、版本元数据与现行版本指针。"""
-
-    def __init__(self, db_path: str):
-        self._db_path = db_path
-        directory = os.path.dirname(db_path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        self._init_db()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _init_db(self) -> None:
-        conn = self._connect()
-        try:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS policies (
-                    policy_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    scope_key TEXT DEFAULT '',
-                    current_version_id TEXT,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS policy_versions (
-                    version_id TEXT PRIMARY KEY,
-                    policy_id TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    version_no TEXT,
-                    issue_code TEXT,
-                    effective_at TEXT,
-                    superseded_at TEXT,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    scope_key TEXT DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_policy_versions_policy_active
-                ON policy_versions(policy_id, is_active);
-
-                CREATE INDEX IF NOT EXISTS idx_policy_versions_issue_code
-                ON policy_versions(issue_code);
-
-                CREATE INDEX IF NOT EXISTS idx_policy_versions_effective_at
-                ON policy_versions(effective_at);
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def get_active_version(self, policy_id: str) -> Optional[Dict[str, Any]]:
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                """
-                SELECT * FROM policy_versions
-                WHERE policy_id = ? AND is_active = 1
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (policy_id,),
-            ).fetchone()
-        finally:
-            conn.close()
-        return dict(row) if row else None
-
-    def publish_version(self, metadata: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        now = _utcnow()
-        policy_id = str(metadata["policy_id"])
-        version_id = str(metadata["version_id"])
-        title = str(metadata.get("title", "") or policy_id)
-        version_no = str(metadata.get("version_no", "") or "")
-        issue_code = str(metadata.get("issue_code", "") or "")
-        effective_at = metadata.get("effective_at") or None
-        scope_key = str(metadata.get("scope_key", "") or "")
-
-        conn = self._connect()
-        try:
-            previous = conn.execute(
-                """
-                SELECT * FROM policy_versions
-                WHERE policy_id = ? AND is_active = 1
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (policy_id,),
-            ).fetchone()
-
-            conn.execute(
-                """
-                INSERT INTO policies(policy_id, title, scope_key, current_version_id, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(policy_id) DO UPDATE SET
-                    title = excluded.title,
-                    scope_key = excluded.scope_key,
-                    current_version_id = excluded.current_version_id,
-                    updated_at = excluded.updated_at
-                """,
-                (policy_id, title, scope_key, version_id, now),
-            )
-
-            conn.execute(
-                """
-                INSERT INTO policy_versions(
-                    version_id, policy_id, title, version_no, issue_code,
-                    effective_at, superseded_at, is_active, scope_key, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                ON CONFLICT(version_id) DO UPDATE SET
-                    policy_id = excluded.policy_id,
-                    title = excluded.title,
-                    version_no = excluded.version_no,
-                    issue_code = excluded.issue_code,
-                    effective_at = excluded.effective_at,
-                    is_active = 1,
-                    scope_key = excluded.scope_key,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    version_id,
-                    policy_id,
-                    title,
-                    version_no,
-                    issue_code,
-                    effective_at,
-                    None,
-                    scope_key,
-                    now,
-                    now,
-                ),
-            )
-
-            if previous and previous["version_id"] != version_id:
-                superseded_at = effective_at or now[:10]
-                conn.execute(
-                    """
-                    UPDATE policy_versions
-                    SET is_active = 0, superseded_at = ?, updated_at = ?
-                    WHERE version_id = ?
-                    """,
-                    (superseded_at, now, previous["version_id"]),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-
-        return dict(previous) if previous and previous["version_id"] != version_id else None
-
-    def resolve_versions(self, target: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if not target:
-            return []
-
-        policy_ids = list(dict.fromkeys(target.get("policy_ids") or []))
-        issue_code = str(target.get("issue_code", "") or "").strip()
-        version_no = str(target.get("version_no", "") or "").strip()
-        target_date = str(target.get("target_date", "") or "").strip()
-
-        conn = self._connect()
-        try:
-            if issue_code:
-                rows = conn.execute(
-                    self._in_clause_sql(
-                        """
-                        SELECT * FROM policy_versions
-                        WHERE issue_code = ?
-                        {policy_filter}
-                        ORDER BY is_active DESC, effective_at DESC, updated_at DESC
-                        """,
-                        policy_ids,
-                    ),
-                    tuple([issue_code] + policy_ids),
-                ).fetchall()
-                if rows:
-                    return [dict(row) for row in rows]
-
-            if version_no:
-                rows = conn.execute(
-                    self._in_clause_sql(
-                        """
-                        SELECT * FROM policy_versions
-                        WHERE lower(version_no) = lower(?)
-                        {policy_filter}
-                        ORDER BY is_active DESC, effective_at DESC, updated_at DESC
-                        """,
-                        policy_ids,
-                    ),
-                    tuple([version_no] + policy_ids),
-                ).fetchall()
-                if rows:
-                    return [dict(row) for row in rows]
-
-            if target_date:
-                rows = conn.execute(
-                    self._in_clause_sql(
-                        """
-                        SELECT * FROM policy_versions
-                        WHERE effective_at IS NOT NULL
-                          AND effective_at <= ?
-                          AND (superseded_at IS NULL OR superseded_at > ?)
-                        {policy_filter}
-                        ORDER BY effective_at DESC, updated_at DESC
-                        """,
-                        policy_ids,
-                    ),
-                    tuple([target_date, target_date] + policy_ids),
-                ).fetchall()
-                if rows:
-                    return [dict(row) for row in rows]
-
-            if policy_ids:
-                rows = conn.execute(
-                    self._in_clause_sql(
-                        """
-                        SELECT * FROM policy_versions
-                        WHERE is_active = 0
-                        {policy_filter}
-                        ORDER BY effective_at DESC, updated_at DESC
-                        """,
-                        policy_ids,
-                    ),
-                    tuple(policy_ids),
-                ).fetchall()
-                return [dict(row) for row in rows]
-        finally:
-            conn.close()
-
-        return []
-
-    def match_policy_ids(self, query: str) -> List[str]:
-        text = (query or "").strip()
-        if not text:
-            return []
-
-        conn = self._connect()
-        try:
-            rows = conn.execute("SELECT policy_id, title FROM policies ORDER BY updated_at DESC").fetchall()
-        finally:
-            conn.close()
-
-        matched: List[str] = []
-        normalized_query = text.replace(" ", "")
-        for row in rows:
-            policy_id = str(row["policy_id"])
-            title = str(row["title"] or "")
-            normalized_title = title.replace(" ", "")
-            if policy_id in text or (normalized_title and normalized_title in normalized_query):
-                matched.append(policy_id)
-        return matched
-
-    @staticmethod
-    def _in_clause_sql(base_sql: str, policy_ids: List[str]) -> str:
-        if not policy_ids:
-            return base_sql.replace("{policy_filter}", "")
-        placeholders = ", ".join("?" for _ in policy_ids)
-        return base_sql.replace("{policy_filter}", f" AND policy_id IN ({placeholders})")
-
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -305,10 +41,6 @@ class KnowledgeBase:
     COLLECTION_NAME = "knowledge_base"
     PARENT_COLLECTION_NAME = "knowledge_base_parent"
     CHILD_COLLECTION_NAME = "knowledge_base_child"
-    ACTIVE_PARENT_COLLECTION_NAME = "policy_active_parent"
-    ACTIVE_CHILD_COLLECTION_NAME = "policy_active_child"
-    ARCHIVE_PARENT_COLLECTION_NAME = "policy_archive_parent"
-    ARCHIVE_CHILD_COLLECTION_NAME = "policy_archive_child"
     DEFAULT_RECALL_TOP_K = 20
     DEFAULT_RRF_K = 60
     DEFAULT_RERANK_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
@@ -321,15 +53,10 @@ class KnowledgeBase:
         chroma_path: str = "./data/chroma",
     ):
         self._child_records: List[Dict[str, Any]] = []
-        self._archive_child_records: List[Dict[str, Any]] = []
         self._bm25_doc_tokens: List[List[str]] = []
         self._bm25_term_freqs: List[Counter[str]] = []
         self._bm25_doc_freq: Dict[str, int] = {}
         self._bm25_avgdl = 0.0
-        self._archive_bm25_doc_tokens: List[List[str]] = []
-        self._archive_bm25_term_freqs: List[Counter[str]] = []
-        self._archive_bm25_doc_freq: Dict[str, int] = {}
-        self._archive_bm25_avgdl = 0.0
         self._hybrid_recall_k = self._read_int_env("RAG_HYBRID_RECALL_K", self.DEFAULT_RECALL_TOP_K)
         self._rrf_k = self._read_int_env("RAG_RRF_K", self.DEFAULT_RRF_K)
         self._rerank_url = os.getenv("DASHSCOPE_RERANK_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks").strip()
@@ -337,7 +64,6 @@ class KnowledgeBase:
         self._rerank_model = os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank").strip() or "qwen3-rerank"
         self._rerank_instruct = os.getenv("DASHSCOPE_RERANK_INSTRUCT", self.DEFAULT_RERANK_INSTRUCT).strip() or self.DEFAULT_RERANK_INSTRUCT
         self._rerank_score_threshold = self._read_float_env("RAG_RERANK_SCORE_THRESHOLD", self.DEFAULT_RERANK_SCORE_THRESHOLD)
-        self._policy_catalog = PolicyCatalog(os.path.join(chroma_path, "policy_catalog.sqlite3"))
 
         # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
         self._use_server = False
@@ -355,33 +81,23 @@ class KnowledgeBase:
 
         # 使用服务端时不传 embedding_function，让服务端处理
         # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
-        self._active_parent_collection = self._client.get_or_create_collection(
-            name=self.ACTIVE_PARENT_COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 现行制度父块"},
+        self._parent_collection = self._client.get_or_create_collection(
+            name=self.PARENT_COLLECTION_NAME,
+            metadata={"description": "EchoMind RAG 知识库父块"},
         )
-        self._active_child_collection = self._client.get_or_create_collection(
-            name=self.ACTIVE_CHILD_COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 现行制度子块索引"},
+        self._child_collection = self._client.get_or_create_collection(
+            name=self.CHILD_COLLECTION_NAME,
+            metadata={"description": "EchoMind RAG 知识库子块索引"},
         )
-        self._archive_parent_collection = self._client.get_or_create_collection(
-            name=self.ARCHIVE_PARENT_COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 历史制度父块"},
-        )
-        self._archive_child_collection = self._client.get_or_create_collection(
-            name=self.ARCHIVE_CHILD_COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 历史制度子块索引"},
-        )
-        self._parent_collection = self._active_parent_collection
-        self._child_collection = self._active_child_collection
         # 兼容旧调用和旧测试桩
         self._collection = self._child_collection
 
         # 如果知识库为空，导入默认文档
-        if self._active_child_collection.count() == 0:
-            self._load_default_docs()
+        if self._child_collection.count() == 0:
+            if self._should_auto_seed():
+                self._load_default_docs()
         else:
-            self._load_child_records_from_collection(scope="active")
-            self._load_child_records_from_collection(scope="archive")
+            self._load_child_records_from_collection()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -394,18 +110,11 @@ class KnowledgeBase:
         """
         if not hasattr(self, "_child_records"):
             self._child_records = []
-        if not hasattr(self, "_archive_child_records"):
-            self._archive_child_records = []
-        self._ensure_policy_storage()
-
         total_added = 0
         for doc in documents:
             title = doc.get("title", "")
             content = doc.get("content", "")
-            metadata = self._build_policy_metadata(doc)
-            previous_active = self._policy_catalog.publish_version(metadata)
-            if previous_active:
-                self._archive_policy_version(previous_active)
+            metadata = self._build_doc_metadata(doc)
 
             parent_ids, parent_docs, parent_metas = [], [], []
             child_ids, child_docs, child_metas = [], [], []
@@ -421,12 +130,6 @@ class KnowledgeBase:
                     "title": chunk["title"],
                     "doc_id": chunk["doc_id"],
                     "parent_id": chunk["parent_id"],
-                    "policy_id": chunk["policy_id"],
-                    "version_id": chunk["version_id"],
-                    "version_no": chunk["version_no"],
-                    "issue_code": chunk["issue_code"],
-                    "effective_at": chunk["effective_at"],
-                    "scope_key": chunk["scope_key"],
                     "section_title": chunk["section_title"],
                     "heading_path": chunk["heading_path"],
                     "chunk_index": chunk["chunk_index"],
@@ -443,12 +146,6 @@ class KnowledgeBase:
                     "title": chunk["title"],
                     "doc_id": chunk["doc_id"],
                     "parent_id": chunk["parent_id"],
-                    "policy_id": chunk["policy_id"],
-                    "version_id": chunk["version_id"],
-                    "version_no": chunk["version_no"],
-                    "issue_code": chunk["issue_code"],
-                    "effective_at": chunk["effective_at"],
-                    "scope_key": chunk["scope_key"],
                     "section_title": chunk["section_title"],
                     "heading_path": chunk["heading_path"],
                     "chunk_index": chunk["chunk_index"],
@@ -460,12 +157,6 @@ class KnowledgeBase:
                     "content": chunk["content"],
                     "doc_id": chunk["doc_id"],
                     "parent_id": chunk["parent_id"],
-                    "policy_id": chunk["policy_id"],
-                    "version_id": chunk["version_id"],
-                    "version_no": chunk["version_no"],
-                    "issue_code": chunk["issue_code"],
-                    "effective_at": chunk["effective_at"],
-                    "scope_key": chunk["scope_key"],
                     "section_title": chunk["section_title"],
                     "heading_path": chunk["heading_path"],
                     "chunk_index": chunk["chunk_index"],
@@ -474,30 +165,36 @@ class KnowledgeBase:
                 })
 
             if parent_ids:
-                self._active_parent_collection.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
+                self._parent_collection.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
             if child_ids:
-                self._active_child_collection.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
-                logger.info(f"制度版本导入 active 索引: policy_id={metadata['policy_id']} version_id={metadata['version_id']} 父块={len(parent_ids)} 子块={len(child_ids)}")
+                self._child_collection.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
+                logger.info(f"知识库导入完成: title={title} 父块={len(parent_ids)} 子块={len(child_ids)}")
                 self._child_records.extend(child_records)
                 total_added += len(parent_ids) + len(child_ids)
 
-        self._rebuild_bm25_index(scope="active")
-        self._rebuild_bm25_index(scope="archive")
+        self._rebuild_bm25_index()
         return total_added
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _should_auto_seed() -> bool:
+        raw = os.getenv("KNOWLEDGE_AUTO_SEED", "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def search(self, query: str, top_k: int = 5, recall_k: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         混合检索：向量召回 + BM25 召回 → RRF 融合 → qwen3-rerank 重排。
 
         最终返回精确 child chunk，同时补充所属 parent 内容，便于后续上下文注入。
         """
-        plan = self._resolve_search_plan(query)
-        recall_k = self._resolve_recall_k(top_k, scope=plan["scope"], filters=plan.get("filters"))
-        vector_hits = self._vector_recall(query, top_n=recall_k, scope=plan["scope"], filters=plan.get("filters"))
-        bm25_hits = self._bm25_recall(query, top_n=recall_k, scope=plan["scope"], filters=plan.get("filters"))
-        fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=recall_k)
+        resolved_recall_k = max(
+            top_k,
+            int(recall_k) if recall_k is not None else self._resolve_recall_k(top_k),
+        )
+        vector_hits = self._vector_recall(query, top_n=resolved_recall_k)
+        bm25_hits = self._bm25_recall(query, top_n=resolved_recall_k)
+        fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=resolved_recall_k)
         reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
-        return self._attach_parent_context(reranked, scope=plan["scope"])
+        return self._attach_parent_context(reranked)
 
     @property
     def doc_count(self) -> int:
@@ -521,7 +218,8 @@ class KnowledgeBase:
         """
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return self.search(query, top_k=top_k)
+        recall_k = params.get("recall_k")
+        return self.search(query, top_k=top_k, recall_k=recall_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
@@ -563,12 +261,6 @@ class KnowledgeBase:
 
         metadata = metadata or {}
         doc_id = str(metadata.get("doc_id") or hashlib.md5(f"{title}:{normalized[:200]}".encode()).hexdigest())
-        policy_id = str(metadata.get("policy_id", doc_id))
-        version_id = str(metadata.get("version_id", doc_id))
-        version_no = str(metadata.get("version_no", "") or "")
-        issue_code = str(metadata.get("issue_code", "") or "")
-        effective_at = metadata.get("effective_at")
-        scope_key = str(metadata.get("scope_key", "") or "")
         sections = self._split_sections(title, normalized)
         chunks: List[Dict[str, Any]] = []
 
@@ -578,13 +270,7 @@ class KnowledgeBase:
                 chunk_index = len(chunks)
                 chunks.append({
                     "doc_id": doc_id,
-                    "policy_id": policy_id,
-                    "version_id": version_id,
-                    "version_no": version_no,
-                    "issue_code": issue_code,
-                    "effective_at": effective_at,
-                    "scope_key": scope_key,
-                    "parent_id": f"{version_id}:parent:{chunk_index}",
+                    "parent_id": f"{doc_id}:parent:{chunk_index}",
                     "title": title,
                     "section_title": section["section_title"],
                     "heading_path": section["heading_path"],
@@ -605,12 +291,6 @@ class KnowledgeBase:
                 child_chunks.append({
                     "doc_id": parent["doc_id"],
                     "parent_id": parent["parent_id"],
-                    "policy_id": parent.get("policy_id", parent["doc_id"]),
-                    "version_id": parent.get("version_id", parent["doc_id"]),
-                    "version_no": parent.get("version_no", ""),
-                    "issue_code": parent.get("issue_code", ""),
-                    "effective_at": parent.get("effective_at"),
-                    "scope_key": parent.get("scope_key", ""),
                     "title": parent["title"],
                     "section_title": parent["section_title"],
                     "heading_path": parent["heading_path"],
@@ -621,15 +301,15 @@ class KnowledgeBase:
                 })
         return child_chunks
 
-    def _resolve_recall_k(self, top_k: int, scope: str = "active", filters: Optional[Dict[str, Any]] = None) -> int:
+    def _resolve_recall_k(self, top_k: int) -> int:
         baseline = max(top_k, getattr(self, "_hybrid_recall_k", self.DEFAULT_RECALL_TOP_K))
-        child_count = len(self._filter_records_by_scope(scope, filters=filters))
+        child_count = len(getattr(self, "_child_records", []))
         if child_count > 0:
             return max(top_k, min(baseline, child_count))
         return baseline
 
-    def _vector_recall(self, query: str, top_n: int, scope: str = "active", filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        child_collection = self._get_child_collection(scope)
+    def _vector_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
+        child_collection = self._get_child_collection()
         if child_collection is None:
             return []
 
@@ -650,17 +330,15 @@ class KnowledgeBase:
         for doc, meta, dist in zip(docs, metas, dists):
             if not isinstance(meta, dict):
                 continue
-            if not self._record_matches_filters(meta, filters):
-                continue
             score = round(1.0 - float(dist), 4)
             hits.append(self._build_candidate_from_meta(meta, doc, vector_score=score))
 
         hits.sort(key=lambda item: item.get("vector_score", 0.0), reverse=True)
         return hits[:top_n]
 
-    def _bm25_recall(self, query: str, top_n: int, scope: str = "active", filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        self._ensure_bm25_index(scope=scope)
-        records = self._filter_records_by_scope(scope, filters=filters)
+    def _bm25_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
+        self._ensure_bm25_index()
+        records = list(getattr(self, "_child_records", []))
         if not records:
             return []
 
@@ -668,10 +346,10 @@ class KnowledgeBase:
         if not query_terms:
             return []
 
-        avgdl = self._get_bm25_avgdl(scope) or 1.0
-        term_freqs = [Counter(self._tokenize_for_bm25(record.get("content", "")) or [record.get("content", "")]) for record in records]
-        doc_tokens = [self._tokenize_for_bm25(record.get("content", "")) or [record.get("content", "")] for record in records]
-        doc_freq = self._build_doc_freq(doc_tokens)
+        avgdl = self._get_bm25_avgdl() or 1.0
+        term_freqs = getattr(self, "_bm25_term_freqs", [])
+        doc_tokens = getattr(self, "_bm25_doc_tokens", [])
+        doc_freq = getattr(self, "_bm25_doc_freq", {})
         total_docs = len(records)
         scored: List[Dict[str, Any]] = []
 
@@ -792,11 +470,11 @@ class KnowledgeBase:
 
         return self._apply_rerank_scores(candidates[:top_n])
 
-    def _attach_parent_context(self, items: List[Dict[str, Any]], scope: str = "active") -> List[Dict[str, Any]]:
+    def _attach_parent_context(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not items:
             return []
 
-        parent_collection = self._get_parent_collection(scope)
+        parent_collection = self._get_parent_collection()
         if parent_collection is None:
             return items
 
@@ -836,11 +514,6 @@ class KnowledgeBase:
                 updated["title"] = meta.get("title", updated.get("title", ""))
                 updated["section_title"] = meta.get("section_title", updated.get("section_title", updated.get("title", "")))
                 updated["heading_path"] = meta.get("heading_path", updated.get("heading_path", updated.get("title", "")))
-                updated["policy_id"] = meta.get("policy_id", updated.get("policy_id", ""))
-                updated["version_id"] = meta.get("version_id", updated.get("version_id", ""))
-                updated["version_no"] = meta.get("version_no", updated.get("version_no", ""))
-                updated["issue_code"] = meta.get("issue_code", updated.get("issue_code", ""))
-                updated["effective_at"] = meta.get("effective_at", updated.get("effective_at"))
             enriched.append(updated)
         return enriched
 
@@ -873,38 +546,23 @@ class KnowledgeBase:
             "chunk": meta.get("chunk_index", 0),
             "doc_id": meta.get("doc_id", ""),
             "parent_id": meta.get("parent_id", ""),
-            "policy_id": meta.get("policy_id", meta.get("doc_id", "")),
-            "version_id": meta.get("version_id", meta.get("doc_id", "")),
-            "version_no": meta.get("version_no", ""),
-            "issue_code": meta.get("issue_code", ""),
-            "effective_at": meta.get("effective_at"),
             "section_title": meta.get("section_title", meta.get("title", "")),
             "heading_path": meta.get("heading_path", meta.get("title", "")),
             "matched_child_content": content,
             "matched_child_chunk": child_chunk,
         }
 
-    def _ensure_bm25_index(self, scope: str = "active") -> None:
-        if scope == "archive":
-            if getattr(self, "_archive_bm25_doc_tokens", None):
-                return
-            if not hasattr(self, "_archive_child_records"):
-                self._archive_child_records = []
-            if not getattr(self, "_archive_child_records", None):
-                self._load_child_records_from_collection(scope="archive")
-            self._rebuild_bm25_index(scope="archive")
-            return
-
+    def _ensure_bm25_index(self) -> None:
         if getattr(self, "_bm25_doc_tokens", None):
             return
         if not hasattr(self, "_child_records"):
             self._child_records = []
         if not getattr(self, "_child_records", None):
-            self._load_child_records_from_collection(scope="active")
-        self._rebuild_bm25_index(scope="active")
+            self._load_child_records_from_collection()
+        self._rebuild_bm25_index()
 
-    def _load_child_records_from_collection(self, scope: str = "active") -> None:
-        child_collection = self._get_child_collection(scope)
+    def _load_child_records_from_collection(self) -> None:
+        child_collection = self._get_child_collection()
         if child_collection is None or not hasattr(child_collection, "get"):
             return
 
@@ -927,25 +585,17 @@ class KnowledgeBase:
                 "content": doc,
                 "doc_id": meta.get("doc_id", ""),
                 "parent_id": meta.get("parent_id", ""),
-                "policy_id": meta.get("policy_id", meta.get("doc_id", "")),
-                "version_id": meta.get("version_id", meta.get("doc_id", "")),
-                "version_no": meta.get("version_no", ""),
-                "issue_code": meta.get("issue_code", ""),
-                "effective_at": meta.get("effective_at"),
                 "section_title": meta.get("section_title", meta.get("title", "")),
                 "heading_path": meta.get("heading_path", meta.get("title", "")),
                 "chunk_index": meta.get("chunk_index", 0),
                 "child_chunk_index": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
                 "total_chunks": meta.get("total_chunks", 1),
             })
-        if scope == "archive":
-            self._archive_child_records = records
-        else:
-            self._child_records = records
-        self._rebuild_bm25_index(scope=scope)
+        self._child_records = records
+        self._rebuild_bm25_index()
 
-    def _rebuild_bm25_index(self, scope: str = "active") -> None:
-        records = self._records_for_scope(scope)
+    def _rebuild_bm25_index(self) -> None:
+        records = getattr(self, "_child_records", [])
         doc_tokens: List[List[str]] = []
         term_freqs: List[Counter[str]] = []
         doc_freq: Dict[str, int] = {}
@@ -963,16 +613,10 @@ class KnowledgeBase:
                 doc_freq[term] = doc_freq.get(term, 0) + 1
 
         avgdl = (total_len / len(records)) if records else 0.0
-        if scope == "archive":
-            self._archive_bm25_doc_tokens = doc_tokens
-            self._archive_bm25_term_freqs = term_freqs
-            self._archive_bm25_doc_freq = doc_freq
-            self._archive_bm25_avgdl = avgdl
-        else:
-            self._bm25_doc_tokens = doc_tokens
-            self._bm25_term_freqs = term_freqs
-            self._bm25_doc_freq = doc_freq
-            self._bm25_avgdl = avgdl
+        self._bm25_doc_tokens = doc_tokens
+        self._bm25_term_freqs = term_freqs
+        self._bm25_doc_freq = doc_freq
+        self._bm25_avgdl = avgdl
 
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         text = self._normalize_text(text).lower()
@@ -1050,214 +694,26 @@ class KnowledgeBase:
             if isinstance(value, (str, int, float, bool))
         }
 
-    def _records_for_scope(self, scope: str) -> List[Dict[str, Any]]:
-        if scope == "archive":
-            return getattr(self, "_archive_child_records", [])
-        return getattr(self, "_child_records", [])
-
-    def _ensure_policy_storage(self) -> None:
-        if not hasattr(self, "_policy_catalog"):
-            self._policy_catalog = PolicyCatalog(os.path.join(".", "data", "chroma", "policy_catalog.sqlite3"))
-        if not hasattr(self, "_active_parent_collection"):
-            self._active_parent_collection = getattr(self, "_parent_collection", None)
-        if not hasattr(self, "_active_child_collection"):
-            self._active_child_collection = getattr(self, "_child_collection", getattr(self, "_collection", None))
-        if not hasattr(self, "_archive_parent_collection"):
-            self._archive_parent_collection = getattr(self, "_parent_collection", None)
-        if not hasattr(self, "_archive_child_collection"):
-            self._archive_child_collection = getattr(self, "_child_collection", getattr(self, "_collection", None))
-
-    def _get_bm25_avgdl(self, scope: str) -> float:
-        if scope == "archive":
-            return float(getattr(self, "_archive_bm25_avgdl", 0.0))
-        return float(getattr(self, "_bm25_avgdl", 0.0))
-
-    def _get_parent_collection(self, scope: str):
-        if scope == "archive":
-            return getattr(self, "_archive_parent_collection", getattr(self, "_parent_collection", None))
-        return getattr(self, "_active_parent_collection", getattr(self, "_parent_collection", None))
-
-    def _get_child_collection(self, scope: str):
-        if scope == "archive":
-            return getattr(self, "_archive_child_collection", None)
-        return getattr(self, "_active_child_collection", getattr(self, "_child_collection", getattr(self, "_collection", None)))
-
-    def _filter_records_by_scope(self, scope: str, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        records = self._records_for_scope(scope)
-        if not filters:
-            return list(records)
-        return [record for record in records if self._record_matches_filters(record, filters)]
-
-    @staticmethod
-    def _record_matches_filters(record: Dict[str, Any], filters: Optional[Dict[str, Any]]) -> bool:
-        if not filters:
-            return True
-        version_ids = filters.get("version_ids") or []
-        if version_ids and record.get("version_id") not in version_ids:
-            return False
-        policy_ids = filters.get("policy_ids") or []
-        if policy_ids and record.get("policy_id") not in policy_ids:
-            return False
-        return True
-
-    def _build_policy_metadata(self, doc: Dict[str, Any]) -> Dict[str, Any]:
-        title = str(doc.get("title", "") or "未命名制度")
+    def _build_doc_metadata(self, doc: Dict[str, Any]) -> Dict[str, Any]:
+        title = str(doc.get("title", "") or "未命名文档")
         content = self._normalize_text(doc.get("content", ""))
-        policy_id = str(doc.get("policy_id") or hashlib.md5(title.encode()).hexdigest())
-        version_no = str(doc.get("version_no", "") or "")
-        issue_code = str(doc.get("issue_code", "") or "")
-        effective_at = self._normalize_optional_date(doc.get("effective_at"))
-        scope_key = str(doc.get("scope_key", "") or "")
-        version_hint = version_no or issue_code or effective_at or content[:120]
-        version_id = str(doc.get("version_id") or hashlib.md5(f"{policy_id}:{version_hint}".encode()).hexdigest())
         doc_id = str(doc.get("doc_id") or hashlib.md5(f"{title}:{content[:200]}".encode()).hexdigest())
         return {
             "title": title,
-            "policy_id": policy_id,
-            "version_id": version_id,
-            "version_no": version_no,
-            "issue_code": issue_code,
-            "effective_at": effective_at,
-            "scope_key": scope_key,
             "doc_id": doc_id,
         }
 
-    @staticmethod
-    def _normalize_optional_date(value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return text[:10]
+    def _get_bm25_avgdl(self) -> float:
+        return float(getattr(self, "_bm25_avgdl", 0.0))
 
-    def _archive_policy_version(self, version_row: Dict[str, Any]) -> None:
-        version_id = str(version_row.get("version_id", ""))
-        if not version_id:
-            return
+    def _get_parent_collection(self):
+        return getattr(self, "_parent_collection", None)
 
-        active_parent = self._active_parent_collection
-        active_child = self._active_child_collection
-        archive_parent = self._archive_parent_collection
-        archive_child = self._archive_child_collection
-
-        parent_results = self._safe_collection_get(active_parent, where={"version_id": version_id})
-        child_results = self._safe_collection_get(active_child, where={"version_id": version_id})
-
-        self._copy_results_to_collection(parent_results, archive_parent)
-        self._copy_results_to_collection(child_results, archive_child)
-        self._safe_collection_delete(active_parent, where={"version_id": version_id})
-        self._safe_collection_delete(active_child, where={"version_id": version_id})
-
-        self._child_records = [item for item in getattr(self, "_child_records", []) if item.get("version_id") != version_id]
-        archive_records = self._records_from_results(child_results)
-        if archive_records:
-            self._archive_child_records.extend(archive_records)
-
-    def _safe_collection_get(self, collection: Any, where: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        if collection is None or not hasattr(collection, "get"):
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]]}
-        try:
-            return collection.get(where=where, include=["documents", "metadatas"])
-        except TypeError:
-            return collection.get(where=where)
-        except Exception as ex:
-            logger.warning(f"读取集合失败: {ex}")
-            return {"ids": [[]], "documents": [[]], "metadatas": [[]]}
-
-    @staticmethod
-    def _safe_collection_delete(collection: Any, where: Optional[Dict[str, Any]] = None) -> None:
-        if collection is None or not hasattr(collection, "delete"):
-            return
-        try:
-            collection.delete(where=where)
-        except Exception as ex:
-            logger.warning(f"删除集合数据失败: {ex}")
-
-    def _copy_results_to_collection(self, results: Dict[str, Any], collection: Any) -> None:
-        if collection is None or not hasattr(collection, "add"):
-            return
-        ids = self._flatten_result_rows(results.get("ids", []))
-        docs = self._flatten_result_rows(results.get("documents", []))
-        metas = self._flatten_result_rows(results.get("metadatas", []))
-        if not ids:
-            return
-        collection.add(ids=ids, documents=docs, metadatas=metas)
-
-    def _records_from_results(self, results: Dict[str, Any]) -> List[Dict[str, Any]]:
-        docs = self._flatten_result_rows(results.get("documents", []))
-        metas = self._flatten_result_rows(results.get("metadatas", []))
-        records: List[Dict[str, Any]] = []
-        for doc, meta in zip(docs, metas):
-            if not isinstance(meta, dict):
-                continue
-            records.append({
-                "title": meta.get("title", ""),
-                "content": doc,
-                "doc_id": meta.get("doc_id", ""),
-                "parent_id": meta.get("parent_id", ""),
-                "policy_id": meta.get("policy_id", meta.get("doc_id", "")),
-                "version_id": meta.get("version_id", meta.get("doc_id", "")),
-                "version_no": meta.get("version_no", ""),
-                "issue_code": meta.get("issue_code", ""),
-                "effective_at": meta.get("effective_at"),
-                "section_title": meta.get("section_title", meta.get("title", "")),
-                "heading_path": meta.get("heading_path", meta.get("title", "")),
-                "chunk_index": meta.get("chunk_index", 0),
-                "child_chunk_index": meta.get("child_chunk_index", meta.get("chunk_index", 0)),
-                "total_chunks": meta.get("total_chunks", 1),
-            })
-        return records
+    def _get_child_collection(self):
+        return getattr(self, "_child_collection", getattr(self, "_collection", None))
 
     def _resolve_search_plan(self, query: str) -> Dict[str, Any]:
-        text = (query or "").strip()
-        target = self._extract_history_target(text)
-        if not target:
-            return {"scope": "active", "filters": {}}
-
-        policy_ids = self._policy_catalog.match_policy_ids(text) if hasattr(self, "_policy_catalog") else []
-        target["policy_ids"] = policy_ids
-        versions = self._policy_catalog.resolve_versions(target) if hasattr(self, "_policy_catalog") else []
-        if not versions:
-            filters: Dict[str, Any] = {}
-            if policy_ids:
-                filters["policy_ids"] = policy_ids
-            return {"scope": "archive", "filters": filters}
-
-        return {
-            "scope": "archive",
-            "filters": {
-                "version_ids": [str(item["version_id"]) for item in versions],
-                "policy_ids": [str(item["policy_id"]) for item in versions if item.get("policy_id")],
-            },
-        }
-
-    def _extract_history_target(self, query: str) -> Optional[Dict[str, Any]]:
-        text = (query or "").strip()
-        if not text:
-            return None
-
-        has_history_intent = any(keyword in text for keyword in [
-            "历史", "旧版", "旧制度", "原制度", "之前", "当时", "沿用", "版本", "第", "号",
-        ])
-        issue_match = re.search(r"[\u4e00-\u9fff]{1,8}〔\d{4}〕\d+号", text)
-        version_match = re.search(r"\b[vV]\s*\d+\b", text)
-        date_match = re.search(r"(\d{4})[年/-](\d{1,2})(?:[月/-](\d{1,2}))?", text)
-
-        if not (has_history_intent or issue_match or version_match or date_match):
-            return None
-
-        target: Dict[str, Any] = {}
-        if issue_match:
-            target["issue_code"] = issue_match.group(0)
-        if version_match:
-            target["version_no"] = re.sub(r"\s+", "", version_match.group(0)).lower()
-        if date_match:
-            year = int(date_match.group(1))
-            month = int(date_match.group(2))
-            day = int(date_match.group(3) or 1)
-            target["target_date"] = f"{year:04d}-{month:02d}-{day:02d}"
-        return target or {"history": True}
+        return {"scope": "active", "filters": {}}
 
     def _split_sections(self, title: str, text: str) -> List[Dict[str, str]]:
         sections: List[Dict[str, str]] = []

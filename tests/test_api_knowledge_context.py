@@ -24,8 +24,6 @@ class _FakeToolManager:
                 "score": 0.9321,
                 "matched_child_content": "审核通过后，款项将在 5-7 个工作日内退回原支付账户。",
                 "parent_content": "退款政策说明。审核通过后，款项将在 5-7 个工作日内退回原支付账户。",
-                "version_no": "V2",
-                "effective_at": "2025-01-01",
             }
         ])
 
@@ -35,27 +33,11 @@ class _FakeKnowledgeBase:
         self._child_records = [
             {
                 "title": "退款政策",
-                "policy_id": "policy-refund",
-                "version_id": "version-refund-v2",
-                "version_no": "V2",
-                "effective_at": "2025-01-01",
-                "parent_id": "version-refund-v2:parent:0",
+                "doc_id": "refund-doc",
+                "parent_id": "refund-doc:parent:0",
                 "child_chunk_index": 0,
                 "heading_path": "制度中心 > 财务 > 退款政策",
                 "content": "审核通过后，款项将在 5-7 个工作日内退回原支付账户。",
-            }
-        ]
-        self._archive_child_records = [
-            {
-                "title": "退款政策",
-                "policy_id": "policy-refund",
-                "version_id": "version-refund-v1",
-                "version_no": "V1",
-                "effective_at": "2024-01-01",
-                "parent_id": "version-refund-v1:parent:0",
-                "child_chunk_index": 0,
-                "heading_path": "制度中心 > 财务 > 退款政策",
-                "content": "旧版退款到账时间为 7-10 个工作日。",
             }
         ]
 
@@ -79,12 +61,12 @@ class BuildKnowledgeContextTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         api_main._tool_manager = self._original_tool_manager
 
-    async def test_build_knowledge_context_includes_version_tags(self):
+    async def test_build_knowledge_context_omits_version_tags(self):
         context, used = await api_main._build_knowledge_context("退款多久到账", top_k=3)
 
         self.assertTrue(used)
-        self.assertIn("版本号: V2", context)
-        self.assertIn("生效时间: 2025-01-01", context)
+        self.assertNotIn("版本号:", context)
+        self.assertNotIn("生效时间:", context)
         self.assertIn("命中片段: 审核通过后，款项将在 5-7 个工作日内退回原支付账户。", context)
 
     async def test_export_knowledge_chunks_returns_chunk_metadata(self):
@@ -95,11 +77,10 @@ class BuildKnowledgeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["total"], 1)
-        self.assertEqual(payload["scope"], "active")
-        self.assertEqual(payload["items"][0]["parent_id"], "version-refund-v2:parent:0")
+        self.assertEqual(payload["items"][0]["parent_id"], "refund-doc:parent:0")
         self.assertEqual(payload["items"][0]["child_chunk_index"], 0)
-        self.assertEqual(payload["items"][0]["version_no"], "V2")
-        self.assertEqual(payload["items"][0]["effective_at"], "2025-01-01")
+        self.assertNotIn("version_no", payload["items"][0])
+        self.assertNotIn("effective_at", payload["items"][0])
         self.assertIn("退回原支付账户", payload["items"][0]["content"])
 
 

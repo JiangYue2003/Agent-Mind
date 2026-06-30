@@ -1,8 +1,6 @@
 import importlib.util
-import os
 import pathlib
 import sys
-import tempfile
 import types
 import unittest
 
@@ -77,111 +75,36 @@ class InMemoryCollection:
 
 
 class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
-    def _make_kb(self, temp_dir):
+    def _make_kb(self):
         kb = KnowledgeBase.__new__(KnowledgeBase)
         kb._child_records = []
-        kb._archive_child_records = []
         kb._bm25_doc_tokens = []
         kb._bm25_term_freqs = []
         kb._bm25_doc_freq = {}
         kb._bm25_avgdl = 0.0
-        kb._archive_bm25_doc_tokens = []
-        kb._archive_bm25_term_freqs = []
-        kb._archive_bm25_doc_freq = {}
-        kb._archive_bm25_avgdl = 0.0
         kb._hybrid_recall_k = 20
         kb._rrf_k = 60
         kb._rerank_api_key = ""
         kb._rerank_model = "qwen3-rerank"
         kb._rerank_instruct = KnowledgeBase.DEFAULT_RERANK_INSTRUCT
-        kb._policy_catalog = knowledge_base_module.PolicyCatalog(
-            os.path.join(temp_dir, "policy_catalog.sqlite3")
-        )
-        kb._active_parent_collection = InMemoryCollection()
-        kb._active_child_collection = InMemoryCollection()
-        kb._archive_parent_collection = InMemoryCollection()
-        kb._archive_child_collection = InMemoryCollection()
-        kb._parent_collection = kb._active_parent_collection
-        kb._child_collection = kb._active_child_collection
-        kb._collection = kb._active_child_collection
+        kb._parent_collection = InMemoryCollection()
+        kb._child_collection = InMemoryCollection()
+        kb._collection = kb._child_collection
         return kb
 
-    def test_add_documents_archives_previous_active_version_for_same_policy(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            kb = self._make_kb(temp_dir)
-
-            kb.add_documents([{
-                "title": "请假制度",
-                "content": "员工年度可享受 5 天年假。",
-                "policy_id": "policy-leave",
-                "version_no": "v1",
-                "issue_code": "人资〔2024〕15号",
-                "effective_at": "2024-03-01",
-            }])
-            kb.add_documents([{
-                "title": "请假制度",
-                "content": "员工年度可享受 10 天年假。",
-                "policy_id": "policy-leave",
-                "version_no": "v2",
-                "issue_code": "人资〔2025〕02号",
-                "effective_at": "2025-01-01",
-            }])
-
-            active_versions = {
-                entry["metadata"].get("version_no")
-                for entry in kb._active_child_collection.records.values()
-            }
-            archive_versions = {
-                entry["metadata"].get("version_no")
-                for entry in kb._archive_child_collection.records.values()
-            }
-
-            self.assertEqual(active_versions, {"v2"})
-            self.assertIn("v1", archive_versions)
-
-            active_version = kb._policy_catalog.get_active_version("policy-leave")
-            self.assertIsNotNone(active_version)
-            self.assertEqual(active_version["version_no"], "v2")
-
-    def test_resolve_search_plan_defaults_to_active_scope(self):
+    def test_resolve_search_plan_always_returns_default_scope(self):
         kb = KnowledgeBase.__new__(KnowledgeBase)
-        kb._policy_catalog = types.SimpleNamespace(
-            resolve_versions=lambda target: [],
-            match_policy_ids=lambda query: [],
-        )
 
         plan = kb._resolve_search_plan("最新请假制度是什么")
 
         self.assertEqual(plan["scope"], "active")
         self.assertEqual(plan["filters"], {})
 
-    def test_resolve_search_plan_uses_archive_scope_for_explicit_history_query(self):
-        kb = KnowledgeBase.__new__(KnowledgeBase)
-        kb._policy_catalog = types.SimpleNamespace(
-            resolve_versions=lambda target: [{
-                "version_id": "leave-v1",
-                "policy_id": "policy-leave",
-                "title": "请假制度",
-                "version_no": "v1",
-                "issue_code": "人资〔2024〕15号",
-                "effective_at": "2024-03-01",
-                "is_active": 0,
-            }],
-            match_policy_ids=lambda query: ["policy-leave"],
-        )
-
-        plan = kb._resolve_search_plan("请给我看人资〔2024〕15号的请假制度")
-
-        self.assertEqual(plan["scope"], "archive")
-        self.assertEqual(plan["filters"]["version_ids"], ["leave-v1"])
-
     def test_sanitize_metadata_removes_none_values_for_chroma(self):
         kb = KnowledgeBase.__new__(KnowledgeBase)
 
         metadata = kb._sanitize_metadata({
             "title": "退款政策",
-            "policy_id": "policy-refund",
-            "version_id": "v1",
             "effective_at": None,
             "chunk_index": 0,
             "enabled": True,
@@ -191,6 +114,57 @@ class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
         self.assertEqual(metadata["title"], "退款政策")
         self.assertEqual(metadata["chunk_index"], 0)
         self.assertTrue(metadata["enabled"])
+
+    def test_search_prefers_explicit_recall_k_over_default_resolution(self):
+        kb = KnowledgeBase.__new__(KnowledgeBase)
+        kb._resolve_search_plan = lambda query: {"scope": "active", "filters": {}}
+        seen = {}
+
+        def fake_vector_recall(query, top_n, scope="active", filters=None):
+            seen["vector_top_n"] = top_n
+            return [{
+                "parent_id": "p1",
+                "matched_child_chunk": 0,
+                "policy_id": "policy-1",
+                "score": 0.9,
+            }]
+
+        def fake_bm25_recall(query, top_n, scope="active", filters=None):
+            seen["bm25_top_n"] = top_n
+            return [{
+                "parent_id": "p1",
+                "matched_child_chunk": 0,
+                "policy_id": "policy-1",
+                "score": 0.8,
+            }]
+
+        kb._vector_recall = fake_vector_recall
+        kb._bm25_recall = fake_bm25_recall
+        kb._fuse_recall_results = lambda vector_hits, bm25_hits, top_n: vector_hits + bm25_hits
+        kb._rerank_candidates = lambda query, candidates, top_n: candidates[:top_n]
+        kb._attach_parent_context = lambda items, scope="active": items
+
+        results = kb.search("退款多久到账", top_k=3, recall_k=11)
+
+        self.assertEqual(seen["vector_top_n"], 11)
+        self.assertEqual(seen["bm25_top_n"], 11)
+        self.assertEqual(len(results), 2)
+
+    def test_add_documents_writes_single_collection_without_version_metadata(self):
+        kb = self._make_kb()
+
+        added = kb.add_documents([{
+            "title": "请假制度",
+            "content": "员工年度可享受 10 天年假。",
+        }])
+
+        self.assertGreater(added, 0)
+        self.assertGreater(kb._parent_collection.count(), 0)
+        self.assertGreater(kb._child_collection.count(), 0)
+        child_meta = next(iter(kb._child_collection.records.values()))["metadata"]
+        self.assertNotIn("version_no", child_meta)
+        self.assertNotIn("effective_at", child_meta)
+        self.assertNotIn("policy_id", child_meta)
 
 
 if __name__ == "__main__":
