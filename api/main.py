@@ -10,6 +10,7 @@ import os
 import pathlib
 import sys
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -49,6 +50,31 @@ _memory       = None
 _tool_manager = None
 _monitor      = None
 _evaluator    = None
+_chat_intent_recognizer = None
+_mock_handoff_records: List[Dict[str, Any]] = []
+
+_MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
+    "ORD20250701001": {
+        "order_id": "ORD20250701001",
+        "user_id": "u123",
+        "status": "运输中",
+        "payment_status": "已支付",
+        "shipment_status": "运输中",
+        "refund_status": "",
+        "updated_at": "2026-07-02T10:20:00+08:00",
+        "source": "mock_oms",
+    },
+    "ORD20250701002": {
+        "order_id": "ORD20250701002",
+        "user_id": "u456",
+        "status": "已退款",
+        "payment_status": "已支付",
+        "shipment_status": "未发货",
+        "refund_status": "退款成功",
+        "updated_at": "2026-07-02T09:00:00+08:00",
+        "source": "mock_oms",
+    },
+}
 
 
 def _anthropic_cfg() -> Dict[str, Any]:
@@ -67,14 +93,16 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
+    from mcp.handoff_service import HumanHandoffService
     from mcp.knowledge_base import KnowledgeBase
+    from mcp.order_lookup import OrderLookupService
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
@@ -88,6 +116,7 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+    _chat_intent_recognizer = recognizer
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
@@ -118,6 +147,8 @@ async def lifespan(app: FastAPI):
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
     )
+    order_lookup = OrderLookupService(base_url=os.getenv("ORDER_LOOKUP_BASE_URL", "http://localhost:8000"))
+    handoff_service = HumanHandoffService(base_url=os.getenv("HANDOFF_BASE_URL", "http://localhost:8000"))
     logger.info(f"知识库已加载: {kb.doc_count} 个文档片段")
 
     def knowledge_fallback(params: Dict[str, Any], context: Optional[Dict[str, Any]], error: str):
@@ -145,6 +176,42 @@ async def lifespan(app: FastAPI):
         cache_ttl=300.0,
         supports_rerank=True,
         fallback=knowledge_fallback,
+    ))
+    _tool_manager.register(Tool(
+        name="order_lookup",
+        description="查询订单状态（通过外部 OMS 接口）",
+        handler=order_lookup.lookup_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "order_id": {"type": "string"},
+            },
+            "required": ["user_id", "order_id"],
+        },
+        cache_ttl=30.0,
+    ))
+    _tool_manager.register(Tool(
+        name="human_handoff",
+        description="转人工并写入会话上下文到外部客服系统",
+        handler=handoff_service.handoff_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "conv_id": {"type": "string"},
+                "latest_message": {"type": "string"},
+                "intent": {"type": "string"},
+                "urgency": {"type": "string"},
+                "reason": {"type": "string"},
+                "summary": {"type": "string"},
+                "recent_messages": {"type": "array"},
+                "user_profile": {"type": "object"},
+                "order_snapshot": {"type": "object"},
+                "knowledge_context": {"type": "array"},
+            },
+            "required": ["user_id", "conv_id", "latest_message"],
+        },
     ))
 
     # 性能监控（可选启动 Prometheus）
@@ -239,10 +306,14 @@ async def chat(req: ChatRequest):
         for m in mem_ctx.recent_messages[-5:]
     ] if mem_ctx.recent_messages else None
 
+    intent_result = await _recognize_chat_intent(req.message, history)
     knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
     context_parts = [mem_ctx.to_prompt_text()]
     if knowledge_text:
         context_parts.append(knowledge_text)
+    tool_text = await _build_tool_context(req, conv_id, mem_ctx, intent_result)
+    if tool_text:
+        context_parts.append(tool_text)
     full_context = "\n\n".join(part for part in context_parts if part)
 
     orch_req = OrcReq(
@@ -251,6 +322,8 @@ async def chat(req: ChatRequest):
         conv_id=conv_id,
         context=full_context,
         history=history,
+        intent=intent_result.intent if intent_result else None,
+        urgency=intent_result.urgency if intent_result else None,
     )
 
     # 3. 执行
@@ -321,6 +394,184 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
         return "", False
 
 
+async def _recognize_chat_intent(message: str, history: Optional[List[Dict[str, str]]]):
+    recognizer = _chat_intent_recognizer
+    if recognizer is None and _orchestrator is not None:
+        recognizer = getattr(_orchestrator, "_intent_recognizer", None)
+    if recognizer is None:
+        return None
+    try:
+        return await recognizer.recognize(message, history=history)
+    except Exception as ex:
+        logger.warning(f"chat 意图识别失败: {ex}")
+        return None
+
+
+async def _build_tool_context(req: ChatRequest, conv_id: str, mem_ctx: Any, intent_result: Any) -> str:
+    if _tool_manager is None or intent_result is None:
+        return ""
+
+    called_tools: List[str] = []
+    skipped_tools: List[str] = []
+    sections: List[str] = []
+
+    order_snapshot = await _maybe_lookup_order(req, intent_result)
+    if order_snapshot is not None:
+        called_tools.append("order_lookup")
+        sections.append(_format_order_lookup_context(order_snapshot))
+    else:
+        skipped_tools.append("order_lookup")
+
+    handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot)
+    if handoff_result is not None:
+        called_tools.append("human_handoff")
+        sections.append(_format_handoff_context(handoff_result))
+    else:
+        skipped_tools.append("human_handoff")
+
+    if not sections:
+        return ""
+
+    summary = ["[工具增强上下文]", "", "[工具执行摘要]"]
+    summary.append(f"- 已调用工具: {', '.join(called_tools) if called_tools else '无'}")
+    summary.append(f"- 未调用工具: {', '.join(skipped_tools) if skipped_tools else '无'}")
+    summary.append("- 事实优先级: 订单实时状态优先于通用知识说明；人工转接结果优先于推测性答复")
+    return "\n".join(summary + [""] + sections)
+
+
+def _looks_like_order_query(message: str) -> bool:
+    msg = (message or "").lower()
+    keywords = [
+        "订单", "物流", "发货", "配送", "到哪", "进度", "状态", "快递",
+        "order", "shipment", "delivery", "tracking", "status",
+    ]
+    return any(kw in msg for kw in keywords)
+
+
+def _extract_order_id(intent_result: Any) -> str:
+    entities = getattr(intent_result, "entities", {}) or {}
+    order_ids = entities.get("order_id") or []
+    if not order_ids:
+        return ""
+    return str(order_ids[0]).strip()
+
+
+async def _maybe_lookup_order(req: ChatRequest, intent_result: Any) -> Optional[Dict[str, Any]]:
+    order_id = _extract_order_id(intent_result)
+    if not order_id:
+        return None
+    if not _looks_like_order_query(req.message):
+        return None
+
+    try:
+        result = await _tool_manager.call(
+            "order_lookup",
+            {"user_id": req.user_id, "order_id": order_id},
+        )
+    except Exception as ex:
+        logger.warning(f"order_lookup 调用失败: {ex}")
+        return {"status": "failed", "error": str(ex), "order_id": order_id}
+
+    if not result.success or not isinstance(result.data, dict):
+        return {"status": "failed", "error": result.error or "tool_failed", "order_id": order_id}
+    return result.data
+
+
+def _should_handoff(message: str, intent_result: Any) -> bool:
+    intent = getattr(intent_result, "intent", None)
+    if intent is not None and getattr(intent, "value", "") == "escalation":
+        return True
+    msg = (message or "").lower()
+    handoff_keywords = ["转人工", "人工客服", "客服专员", "找人工", "人工处理", "投诉专员"]
+    return any(kw in msg for kw in handoff_keywords)
+
+
+async def _maybe_handoff(
+    req: ChatRequest,
+    conv_id: str,
+    mem_ctx: Any,
+    intent_result: Any,
+    order_snapshot: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not _should_handoff(req.message, intent_result):
+        return None
+
+    recent_messages = []
+    for item in getattr(mem_ctx, "recent_messages", []) or []:
+        role = getattr(getattr(item, "role", None), "value", "")
+        content = getattr(item, "content", "")
+        if role and content:
+            recent_messages.append(f"{role}: {content}")
+
+    params = {
+        "user_id": req.user_id,
+        "conv_id": conv_id,
+        "latest_message": req.message,
+        "intent": getattr(getattr(intent_result, "intent", None), "value", ""),
+        "urgency": getattr(getattr(intent_result, "urgency", None), "name", "").lower(),
+        "reason": "用户明确要求转人工",
+        "summary": getattr(mem_ctx, "summary", ""),
+        "recent_messages": recent_messages,
+        "user_profile": getattr(mem_ctx, "user_profile", {}) or {},
+        "order_snapshot": order_snapshot or {},
+        "knowledge_context": [],
+    }
+
+    try:
+        result = await _tool_manager.call("human_handoff", params)
+    except Exception as ex:
+        logger.warning(f"human_handoff 调用失败: {ex}")
+        return {"status": "failed", "error": str(ex)}
+
+    if not result.success or not isinstance(result.data, dict):
+        return {"status": "failed", "error": result.error or "tool_failed"}
+    return result.data
+
+
+def _format_order_lookup_context(payload: Dict[str, Any]) -> str:
+    lines = ["[order_lookup]"]
+    status = str(payload.get("status", "")).strip() or "unknown"
+    lines.append(f"- 状态: {status}")
+    order_id = str(payload.get("order_id", "")).strip()
+    if order_id:
+        lines.append(f"- 订单号: {order_id}")
+    payment_status = str(payload.get("payment_status", "")).strip()
+    if payment_status:
+        lines.append(f"- 支付状态: {payment_status}")
+    shipment_status = str(payload.get("shipment_status", "")).strip()
+    if shipment_status:
+        lines.append(f"- 物流状态: {shipment_status}")
+    refund_status = str(payload.get("refund_status", "")).strip()
+    if refund_status:
+        lines.append(f"- 退款状态: {refund_status}")
+    updated_at = str(payload.get("updated_at", "")).strip()
+    if updated_at:
+        lines.append(f"- 更新时间: {updated_at}")
+    error = str(payload.get("error", "")).strip()
+    if error:
+        lines.append(f"- 错误信息: {error}")
+    return "\n".join(lines)
+
+
+def _format_handoff_context(payload: Dict[str, Any]) -> str:
+    lines = ["[human_handoff]"]
+    status = str(payload.get("status", "")).strip() or "unknown"
+    lines.append(f"- 状态: {status}")
+    handoff_id = str(payload.get("handoff_id", "")).strip()
+    if handoff_id:
+        lines.append(f"- handoff_id: {handoff_id}")
+    queue = str(payload.get("queue", "")).strip()
+    if queue:
+        lines.append(f"- 队列: {queue}")
+    eta = payload.get("eta_minutes")
+    if eta not in (None, ""):
+        lines.append(f"- 预计等待分钟数: {eta}")
+    error = str(payload.get("error", "")).strip()
+    if error:
+        lines.append(f"- 错误信息: {error}")
+    return "\n".join(lines)
+
+
 def _should_use_knowledge(message: str) -> bool:
     """跳过纯寒暄，业务类问题才检索知识库，避免无关 RAG 干扰回复。"""
     msg = (message or "").strip().lower()
@@ -343,6 +594,46 @@ async def monitor_summary():
     if _monitor is None:
         raise HTTPException(503, "服务未就绪")
     return _monitor.summary()
+
+
+@app.get("/mock/external/orders/{order_id}", tags=["Mock External"])
+async def mock_external_order_lookup(order_id: str, user_id: str):
+    record = _MOCK_ORDER_DATA.get(order_id)
+    if record is None:
+        raise HTTPException(404, "订单不存在")
+    if record.get("user_id") != user_id:
+        raise HTTPException(403, "无权查看该订单")
+    return dict(record)
+
+
+class MockHandoffInput(BaseModel):
+    user_id: str
+    conv_id: str
+    latest_message: str
+    intent: Optional[str] = ""
+    urgency: Optional[str] = ""
+    reason: Optional[str] = ""
+    summary: Optional[str] = ""
+    recent_messages: List[str] = []
+    user_profile: Dict[str, Any] = {}
+    order_snapshot: Dict[str, Any] = {}
+    knowledge_context: List[str] = []
+
+
+@app.post("/mock/external/handoffs", tags=["Mock External"])
+async def mock_external_handoff(body: MockHandoffInput):
+    record = body.model_dump()
+    record["handoff_id"] = f"HD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+    record["queue"] = "general_support"
+    record["status"] = "created"
+    record["eta_minutes"] = 8
+    _mock_handoff_records.append(record)
+    return {
+        "handoff_id": record["handoff_id"],
+        "queue": record["queue"],
+        "status": record["status"],
+        "eta_minutes": record["eta_minutes"],
+    }
 
 
 @app.get("/metrics")
