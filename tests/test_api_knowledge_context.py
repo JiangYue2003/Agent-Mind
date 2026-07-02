@@ -16,7 +16,7 @@ class _FakeToolManager:
     def __init__(self):
         self._tools = {}
 
-    async def search_with_rewrite(self, tool_name, message, top_k=3):
+    async def search_with_rewrite(self, tool_name, message, top_k=3, recall_k=None, context=None):
         return _FakeSearchResult([
             {
                 "title": "退款政策",

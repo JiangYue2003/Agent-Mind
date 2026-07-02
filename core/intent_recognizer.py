@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -20,7 +21,37 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+try:
+    from dashscope import TextEmbedding
+except ImportError:  # pragma: no cover - 运行环境未安装 dashscope 时保留本地兜底
+    TextEmbedding = None
+
 logger = logging.getLogger(__name__)
+
+
+def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {}
+
+    result: Dict[str, Any] = {}
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        value = getattr(usage, key, None)
+        if value is not None:
+            result[key] = value
+
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
+    if reasoning_tokens is not None:
+        result["reasoning_tokens"] = reasoning_tokens
+
+    return result
 
 
 class IntentCategory(Enum):
@@ -103,10 +134,14 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        self._embedding_provider = os.getenv("INTENT_EMBEDDING_PROVIDER", "").strip().lower()
+        self._dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        self._embedding_model = os.getenv("INTENT_EMBEDDING_MODEL", "text-embedding-v3").strip() or "text-embedding-v3"
+        # 默认仍兼容原有行为：官方 Anthropic 路径允许尝试远端 embedding。
+        # 如果显式配置了 DashScope embedding，则即使 LLM 走第三方兼容 base_url 也启用该分支。
+        self._embedding_enabled = self._embedding_provider == "dashscope" and bool(self._dashscope_api_key)
+        if not self._embedding_enabled:
+            self._embedding_enabled = not bool(base_url)
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
@@ -178,6 +213,7 @@ class IntentRecognizer:
         self,
         message: str,
         history: Optional[List[Dict[str, str]]],
+        trace: Any = None,
     ) -> Dict[str, Any]:
         """策略 1：LLM 语义理解（Few-shot + 上下文）。"""
         message = self._clean_text(message)
@@ -210,12 +246,24 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if trace is None:
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=256,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            else:
+                with trace.stage("intent.llm_recognize", model=self.model):
+                    resp = await self.client.messages.create(
+                        model=self.model,
+                        max_tokens=256,
+                        temperature=0.1,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    usage = _extract_usage_dict(resp)
+                    if usage:
+                        trace._stages[-1].meta["usage"] = usage
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
             data = json.loads(raw[s:e])
@@ -293,7 +341,7 @@ class IntentRecognizer:
 
     # ── 实体提取 ──────────────────────────────────────────────────────────────
 
-    async def _extract_entities(self, message: str) -> Dict[str, List[str]]:
+    async def _extract_entities(self, message: str, trace: Any = None) -> Dict[str, List[str]]:
         """用 LLM 从消息中提取结构化实体。"""
         message = self._clean_text(message)
         prompt = f"""从客服消息中提取实体，返回 JSON（字段值为列表，没有则为空列表）:
@@ -301,10 +349,20 @@ class IntentRecognizer:
 格式: {{"order_id":[],"product":[],"date":[],"amount":[],"error_code":[]}}"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self.client.messages.create(
-                model=self.model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if trace is None:
+                resp = await self.client.messages.create(
+                    model=self.model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            else:
+                with trace.stage("intent.extract_entities", model=self.model):
+                    resp = await self.client.messages.create(
+                        model=self.model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    usage = _extract_usage_dict(resp)
+                    if usage:
+                        trace._stages[-1].meta["usage"] = usage
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
             return json.loads(raw[s:e])
@@ -335,6 +393,12 @@ class IntentRecognizer:
         当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
         Embedding 服务缺失导致三路融合中断。
         """
+        if self._embedding_provider == "dashscope" and self._dashscope_api_key and TextEmbedding is not None:
+            try:
+                return await asyncio.to_thread(self._dashscope_embed_text, text)
+            except Exception as ex:
+                logger.warning(f"DashScope Embedding 失败，使用本地向量兜底: {ex}")
+
         embeddings = getattr(self.client, "embeddings", None)
         if embeddings is not None:
             try:
@@ -344,6 +408,22 @@ class IntentRecognizer:
                 logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
 
         return self._local_embedding(text)
+
+    def _dashscope_embed_text(self, text: str) -> List[float]:
+        if TextEmbedding is None:
+            raise RuntimeError("dashscope sdk not installed")
+        response = TextEmbedding.call(
+            api_key=self._dashscope_api_key,
+            model=self._embedding_model,
+            input=text,
+            text_type="query",
+        )
+        if getattr(response, "status_code", None) != 200:
+            raise RuntimeError(getattr(response, "message", "unknown dashscope embedding error"))
+        embeddings = response.output.get("embeddings", []) if getattr(response, "output", None) else []
+        if not embeddings:
+            raise RuntimeError("dashscope embedding response missing embeddings")
+        return list(embeddings[0]["embedding"])
 
     @staticmethod
     def _local_embedding(text: str, dims: int = 256) -> List[float]:

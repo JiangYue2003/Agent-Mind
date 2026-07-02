@@ -34,3 +34,7 @@ build-image*.sh
 *~
 *.bak
 docker-compose(1).yml
+
+
+#具体配置
+.env

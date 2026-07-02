@@ -63,7 +63,7 @@ class _FakeToolManager:
         self.search_calls = []
         self.call_calls = []
 
-    async def search_with_rewrite(self, tool_name, message, top_k=3):
+    async def search_with_rewrite(self, tool_name, message, top_k=3, recall_k=None, context=None):
         self.search_calls.append({
             "tool_name": tool_name,
             "message": message,
@@ -108,7 +108,7 @@ class _FakeOrchestrator:
     def __init__(self):
         self.requests = []
 
-    async def run(self, req):
+    async def run(self, req, context=None):
         self.requests.append(req)
         return OrchestratorResult(
             request_id=req.request_id,

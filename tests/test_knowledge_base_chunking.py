@@ -1,8 +1,10 @@
 import importlib.util
+import os
 import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 def _load_knowledge_base_module():
@@ -157,6 +159,14 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
         self.assertEqual(chunks[1]["section_title"], "审核规则")
         self.assertEqual(chunks[1]["heading_path"], "退款政策 > 审核规则")
         self.assertEqual(chunks[0]["doc_id"], chunks[1]["doc_id"])
+
+    def test_should_auto_seed_defaults_to_false(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(self.kb._should_auto_seed())
+
+    def test_should_auto_seed_accepts_true_values(self):
+        with patch.dict(os.environ, {"KNOWLEDGE_AUTO_SEED": "true"}, clear=True):
+            self.assertTrue(self.kb._should_auto_seed())
 
     def test_search_returns_structural_metadata(self):
         class FakeCollection:

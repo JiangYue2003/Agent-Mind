@@ -107,11 +107,11 @@ class BaseAgent:
         self._model  = model
         self.stats   = AgentStats()
 
-    async def handle(self, req: Request) -> AgentResponse:
+    async def handle(self, req: Request, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
         try:
-            content = await self._call_llm(req)
+            content = await self._call_llm(req, context=context)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
@@ -134,7 +134,7 @@ class BaseAgent:
                 latency_ms=ms,
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request, context: Optional[Dict[str, Any]] = None) -> str:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -144,12 +144,25 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=self.system_prompt,
-            messages=messages,
-        )
+        trace = (context or {}).get("trace")
+        if trace is None:
+            resp = await self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=self.system_prompt,
+                messages=messages,
+            )
+        else:
+            with trace.stage(f"agent.llm_call.{self.agent_type.value}", model=self._model):
+                resp = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=1024,
+                    system=self.system_prompt,
+                    messages=messages,
+                )
+                usage = _extract_usage_dict(resp)
+                if usage:
+                    trace._stages[-1].meta["usage"] = usage
         return resp.content[0].text
 
     def _needs_escalation(self, content: str) -> bool:
@@ -225,16 +238,21 @@ class AgentOrchestrator:
 
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
-    async def run(self, req: Request) -> OrchestratorResult:
+    async def run(self, req: Request, context: Optional[Dict[str, Any]] = None) -> OrchestratorResult:
         """
         处理一次请求的完整流程：
           意图识别 → 路由选 Agent → 执行 → 检查升级 → 返回结果
         """
         t0 = time.monotonic()
+        trace = (context or {}).get("trace")
 
         # 1. 意图识别（如果调用方已识别则跳过）
         if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            if trace is None:
+                intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            else:
+                with trace.stage("orchestrator.intent_recognize"):
+                    intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
             req.intent  = intent_result.intent
             req.urgency = intent_result.urgency
 
@@ -244,17 +262,31 @@ class AgentOrchestrator:
             return await self.run_parallel(req, collaboration)
 
         # 2. 路由：选择 Agent 类型
-        agent_type = self._route(req.intent, req.urgency)
+        if trace is None:
+            agent_type = self._route(req.intent, req.urgency)
+        else:
+            with trace.stage("orchestrator.route"):
+                agent_type = self._route(req.intent, req.urgency)
 
         # 3. 执行（含降级）
-        response = await self._execute(req, agent_type)
+        if trace is None:
+            response = await self._execute(req, agent_type)
+        else:
+            with trace.stage("orchestrator.execute", agent_type=agent_type.value):
+                response = await self._execute(req, agent_type)
 
         # 4. 升级检查
         escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
-            escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：此处创建工单、通知人工客服
+        if trace is None:
+            if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
+                escalated = True
+                logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+        else:
+            with trace.stage("orchestrator.escalation_check"):
+                if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
+                    escalated = True
+                    logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+        # 生产环境：此处创建工单、通知人工客服
 
         return OrchestratorResult(
             request_id=req.request_id,
@@ -356,16 +388,41 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        response = await agent.handle(req, context=context)
 
         # 专属 Agent 失败时降级到 GeneralAgent
         if not response.success and agent_type != AgentType.GENERAL:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                response = await fallback.handle(req, context=context)
 
         return response
+
+
+def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {}
+
+    result: Dict[str, Any] = {}
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        value = getattr(usage, key, None)
+        if value is not None:
+            result[key] = value
+
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
+    if reasoning_tokens is not None:
+        result["reasoning_tokens"] = reasoning_tokens
+
+    return result
 
     # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 

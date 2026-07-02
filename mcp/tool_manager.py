@@ -26,6 +26,31 @@ from anthropic import AsyncAnthropic
 logger = logging.getLogger(__name__)
 
 
+def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {}
+
+    result: Dict[str, Any] = {}
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        value = getattr(usage, key, None)
+        if value is not None:
+            result[key] = value
+
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
+    if reasoning_tokens is not None:
+        result["reasoning_tokens"] = reasoning_tokens
+
+    return result
+
+
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class CircuitState(Enum):
@@ -165,6 +190,7 @@ class MCPToolManager:
           缓存检查 → 熔断检查 → 参数校验 → 执行（含超时）→ 缓存写入 → 可选重排
         """
         tool = self._tools.get(name)
+        trace = (context or {}).get("trace")
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
 
@@ -187,7 +213,11 @@ class MCPToolManager:
             # 参数校验（根据 JSON Schema 的 required 和 properties.type）
             self._validate_params(tool, params)
 
-            data = await asyncio.wait_for(tool.handler(params, context), timeout=tool.timeout_s)
+            if trace is None:
+                data = await asyncio.wait_for(tool.handler(params, context), timeout=tool.timeout_s)
+            else:
+                with trace.stage(f"tool.call.{name}"):
+                    data = await asyncio.wait_for(tool.handler(params, context), timeout=tool.timeout_s)
             latency = (time.monotonic() - t0) * 1000
 
             tool.stats.success += 1
@@ -248,7 +278,7 @@ class MCPToolManager:
 
     # ── 查询改写（解决召回不全）────────────────────────────────────────────────
 
-    async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
+    async def rewrite_query(self, query: str, n: int = 3, trace: Any = None) -> List[str]:
         """
         用 LLM 将原始查询改写为 n 个不同角度的子查询。
 
@@ -265,10 +295,20 @@ class MCPToolManager:
 返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
         prompt = self._clean_text(prompt)
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.3,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if trace is None:
+                resp = await self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.3,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            else:
+                with trace.stage("tool_manager.rewrite_query_llm", model=self._model):
+                    resp = await self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.3,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    usage = _extract_usage_dict(resp)
+                    if usage:
+                        trace._stages[-1].meta["usage"] = usage
             raw = resp.content[0].text
             s, e = raw.find("["), raw.rfind("]") + 1
             queries = json.loads(raw[s:e])
@@ -283,6 +323,7 @@ class MCPToolManager:
         tool_name: str,
         query: str,
         top_k: int = 5,
+        recall_k: Optional[int] = None,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """
@@ -290,27 +331,53 @@ class MCPToolManager:
 
         这是解决"检索不全、召回不好"的完整方案。
         """
+        trace = (context or {}).get("trace")
         # 1. 查询改写：生成多角度子查询
-        sub_queries = await self.rewrite_query(query, n=3)
+        if trace is None:
+            sub_queries = await self.rewrite_query(query, n=3)
+        else:
+            with trace.stage("tool_manager.rewrite_query"):
+                with trace.stage("knowledge.query_rewrite"):
+                    sub_queries = await self.rewrite_query(query, n=3, trace=trace)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         # 2. 并行召回：所有子查询同时检索
-        recall_k = max(top_k, 5)
+        effective_recall_k = max(top_k, int(recall_k)) if recall_k is not None else max(top_k, 5)
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
+            self.call(
+                tool_name,
+                {"query": q, "top_k": effective_recall_k, "recall_k": effective_recall_k},
+                context,
+                use_cache=True,
+            )
             for q in sub_queries
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        if trace is None:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            with trace.stage("tool_manager.parallel_recall", sub_query_count=len(tasks)):
+                with trace.stage("knowledge.hybrid_recall"):
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 3. 合并去重（按内容哈希去重）
         seen, merged = set(), []
-        for r in results:
-            if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
-                for item in r.data:
-                    key = self._dedup_key(item)
-                    if key not in seen:
-                        seen.add(key)
-                        merged.append(item)
+        if trace is None:
+            for r in results:
+                if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
+                    for item in r.data:
+                        key = self._dedup_key(item)
+                        if key not in seen:
+                            seen.add(key)
+                            merged.append(item)
+        else:
+            with trace.stage("tool_manager.merge_dedup"):
+                for r in results:
+                    if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
+                        for item in r.data:
+                            key = self._dedup_key(item)
+                            if key not in seen:
+                                seen.add(key)
+                                merged.append(item)
 
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
@@ -320,12 +387,16 @@ class MCPToolManager:
             merged.sort(key=lambda item: item.get("score", item.get("rerank_score", 0.0)), reverse=True)
             return ToolResult(success=True, data=merged[:top_k], tool_name=tool_name, reranked=True)
 
-        reranked = await self._rerank(query, merged, top_k)
+        if trace is None:
+            reranked = await self._rerank(query, merged, top_k)
+        else:
+            with trace.stage("tool_manager.outer_rerank"):
+                reranked = await self._rerank(query, merged, top_k, trace=trace)
         return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
-    async def _rerank(self, query: str, items: List[Any], top_k: int) -> List[Any]:
+    async def _rerank(self, query: str, items: List[Any], top_k: int, trace: Any = None) -> List[Any]:
         """
         用 LLM 对召回结果重新打分排序。
 
@@ -348,10 +419,20 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if trace is None:
+                resp = await self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            else:
+                with trace.stage("tool_manager.outer_rerank_llm", model=self._model):
+                    resp = await self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    usage = _extract_usage_dict(resp)
+                    if usage:
+                        trace._stages[-1].meta["usage"] = usage
             raw = resp.content[0].text
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])

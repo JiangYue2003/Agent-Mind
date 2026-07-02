@@ -51,6 +51,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _chat_intent_recognizer = None
+_trace_store  = None
 _mock_handoff_records: List[Dict[str, Any]] = []
 
 _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
@@ -91,9 +92,17 @@ def _anthropic_cfg() -> Dict[str, Any]:
     return cfg
 
 
+def _ensure_trace_store():
+    global _trace_store
+    if _trace_store is None:
+        from telemetry.runtime import TraceStore
+        _trace_store = TraceStore(capacity=int(os.getenv("TRACE_STORE_CAPACITY", "200")))
+    return _trace_store
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer, _trace_store
 
     print(BANNER, flush=True)
 
@@ -106,6 +115,7 @@ async def lifespan(app: FastAPI):
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
+    from telemetry.runtime import TraceStore
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -117,6 +127,7 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
     _chat_intent_recognizer = recognizer
+    _trace_store = TraceStore(capacity=int(os.getenv("TRACE_STORE_CAPACITY", "200")))
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
@@ -273,6 +284,7 @@ class ChatResponse(BaseModel):
     escalated:   bool
     latency_ms:  float
     knowledge_used: bool = False
+    trace_id:    str = ""
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -294,47 +306,66 @@ async def chat(req: ChatRequest):
 
     from agents.agent_orchestrator import Request as OrcReq
     from memory.conversation_memory import MsgRole
+    from telemetry.runtime import TraceContext
 
     conv_id = req.conv_id or str(uuid.uuid4())
+    trace = TraceContext(user_id=req.user_id, conv_id=conv_id, message=req.message)
+    trace_store = _ensure_trace_store()
 
-    # 1. 读取记忆上下文
-    mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+    try:
+        with trace.stage("chat.total"):
+            # 1. 读取记忆上下文
+            with trace.stage("memory.read"):
+                mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
 
-    # 2. 构建编排请求（含对话历史，用于意图识别上下文）
-    history = [
-        {"role": m.role.value, "content": m.content}
-        for m in mem_ctx.recent_messages[-5:]
-    ] if mem_ctx.recent_messages else None
+            # 2. 构建编排请求（含对话历史，用于意图识别上下文）
+            history = [
+                {"role": m.role.value, "content": m.content}
+                for m in mem_ctx.recent_messages[-5:]
+            ] if mem_ctx.recent_messages else None
 
-    intent_result = await _recognize_chat_intent(req.message, history)
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message)
-    context_parts = [mem_ctx.to_prompt_text()]
-    if knowledge_text:
-        context_parts.append(knowledge_text)
-    tool_text = await _build_tool_context(req, conv_id, mem_ctx, intent_result)
-    if tool_text:
-        context_parts.append(tool_text)
-    full_context = "\n\n".join(part for part in context_parts if part)
+            with trace.stage("intent.recognize"):
+                intent_result = await _recognize_chat_intent(req.message, history)
+            with trace.stage("knowledge_context.build"):
+                knowledge_text, knowledge_used = await _build_knowledge_context(req.message, context={"trace": trace})
+            context_parts = [mem_ctx.to_prompt_text()]
+            if knowledge_text:
+                context_parts.append(knowledge_text)
+            with trace.stage("tool_augment.build"):
+                tool_text = await _build_tool_context(req, conv_id, mem_ctx, intent_result, trace=trace)
+            if tool_text:
+                context_parts.append(tool_text)
+            full_context = "\n\n".join(part for part in context_parts if part)
 
-    orch_req = OrcReq(
-        message=req.message,
-        user_id=req.user_id,
-        conv_id=conv_id,
-        context=full_context,
-        history=history,
-        intent=intent_result.intent if intent_result else None,
-        urgency=intent_result.urgency if intent_result else None,
-    )
+            orch_req = OrcReq(
+                message=req.message,
+                user_id=req.user_id,
+                conv_id=conv_id,
+                context=full_context,
+                history=history,
+                intent=intent_result.intent if intent_result else None,
+                urgency=intent_result.urgency if intent_result else None,
+            )
 
-    # 3. 执行
-    result = await _orchestrator.run(orch_req)
+            # 3. 执行
+            with trace.stage("orchestrator.run"):
+                result = await _orchestrator.run(orch_req, context={"trace": trace})
 
-    # 4. 写入记忆
-    await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-    await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+            # 4. 写入记忆
+            with trace.stage("memory.write"):
+                await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
+                await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
 
-    # 5. 异步更新用户画像（不阻塞响应）
-    asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+            # 5. 异步更新用户画像（不阻塞响应）
+            with trace.stage("profile_update.schedule"):
+                asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+    except Exception as ex:
+        trace.finalize(success=False, error=str(ex))
+        trace_store.save(trace)
+        raise
+
+    trace.finalize(success=True)
+    trace_store.save(trace)
 
     return ChatResponse(
         conv_id=conv_id,
@@ -344,10 +375,15 @@ async def chat(req: ChatRequest):
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
         knowledge_used=knowledge_used,
+        trace_id=trace.trace_id,
     )
 
 
-async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, bool]:
+async def _build_knowledge_context(
+    message: str,
+    top_k: int = 3,
+    context: Optional[Dict[str, Any]] = None,
+) -> tuple[str, bool]:
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
@@ -358,7 +394,7 @@ async def _build_knowledge_context(message: str, top_k: int = 3) -> tuple[str, b
     if not _should_use_knowledge(message):
         return "", False
     try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
+        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k, context=context)
         if not result.success or not isinstance(result.data, list) or not result.data:
             return "", False
 
@@ -407,7 +443,13 @@ async def _recognize_chat_intent(message: str, history: Optional[List[Dict[str, 
         return None
 
 
-async def _build_tool_context(req: ChatRequest, conv_id: str, mem_ctx: Any, intent_result: Any) -> str:
+async def _build_tool_context(
+    req: ChatRequest,
+    conv_id: str,
+    mem_ctx: Any,
+    intent_result: Any,
+    trace: Any = None,
+) -> str:
     if _tool_manager is None or intent_result is None:
         return ""
 
@@ -415,14 +457,14 @@ async def _build_tool_context(req: ChatRequest, conv_id: str, mem_ctx: Any, inte
     skipped_tools: List[str] = []
     sections: List[str] = []
 
-    order_snapshot = await _maybe_lookup_order(req, intent_result)
+    order_snapshot = await _maybe_lookup_order(req, intent_result, trace=trace)
     if order_snapshot is not None:
         called_tools.append("order_lookup")
         sections.append(_format_order_lookup_context(order_snapshot))
     else:
         skipped_tools.append("order_lookup")
 
-    handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot)
+    handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot, trace=trace)
     if handoff_result is not None:
         called_tools.append("human_handoff")
         sections.append(_format_handoff_context(handoff_result))
@@ -456,7 +498,7 @@ def _extract_order_id(intent_result: Any) -> str:
     return str(order_ids[0]).strip()
 
 
-async def _maybe_lookup_order(req: ChatRequest, intent_result: Any) -> Optional[Dict[str, Any]]:
+async def _maybe_lookup_order(req: ChatRequest, intent_result: Any, trace: Any = None) -> Optional[Dict[str, Any]]:
     order_id = _extract_order_id(intent_result)
     if not order_id:
         return None
@@ -464,10 +506,19 @@ async def _maybe_lookup_order(req: ChatRequest, intent_result: Any) -> Optional[
         return None
 
     try:
-        result = await _tool_manager.call(
-            "order_lookup",
-            {"user_id": req.user_id, "order_id": order_id},
-        )
+        stage = trace.stage("tool.order_lookup") if trace is not None else None
+        if stage is None:
+            result = await _tool_manager.call(
+                "order_lookup",
+                {"user_id": req.user_id, "order_id": order_id},
+            )
+        else:
+            with stage:
+                result = await _tool_manager.call(
+                    "order_lookup",
+                    {"user_id": req.user_id, "order_id": order_id},
+                    context={"trace": trace},
+                )
     except Exception as ex:
         logger.warning(f"order_lookup 调用失败: {ex}")
         return {"status": "failed", "error": str(ex), "order_id": order_id}
@@ -492,6 +543,7 @@ async def _maybe_handoff(
     mem_ctx: Any,
     intent_result: Any,
     order_snapshot: Optional[Dict[str, Any]],
+    trace: Any = None,
 ) -> Optional[Dict[str, Any]]:
     if not _should_handoff(req.message, intent_result):
         return None
@@ -518,7 +570,12 @@ async def _maybe_handoff(
     }
 
     try:
-        result = await _tool_manager.call("human_handoff", params)
+        stage = trace.stage("tool.human_handoff") if trace is not None else None
+        if stage is None:
+            result = await _tool_manager.call("human_handoff", params)
+        else:
+            with stage:
+                result = await _tool_manager.call("human_handoff", params, context={"trace": trace})
     except Exception as ex:
         logger.warning(f"human_handoff 调用失败: {ex}")
         return {"status": "failed", "error": str(ex)}
@@ -594,6 +651,21 @@ async def monitor_summary():
     if _monitor is None:
         raise HTTPException(503, "服务未就绪")
     return _monitor.summary()
+
+
+@app.get("/traces/recent", tags=["Trace"])
+async def recent_traces(limit: int = 20):
+    store = _ensure_trace_store()
+    return {"items": store.recent(limit=limit)}
+
+
+@app.get("/traces/{trace_id}", tags=["Trace"])
+async def get_trace(trace_id: str):
+    store = _ensure_trace_store()
+    payload = store.get(trace_id)
+    if payload is None:
+        raise HTTPException(404, "trace 不存在")
+    return payload
 
 
 @app.get("/mock/external/orders/{order_id}", tags=["Mock External"])

@@ -196,6 +196,31 @@ class KnowledgeBase:
         reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
         return self._attach_parent_context(reranked)
 
+    def search_with_trace(
+        self,
+        query: str,
+        top_k: int = 5,
+        recall_k: Optional[int] = None,
+        trace: Any = None,
+    ) -> List[Dict[str, Any]]:
+        if trace is None:
+            return self.search(query, top_k=top_k, recall_k=recall_k)
+
+        resolved_recall_k = max(
+            top_k,
+            int(recall_k) if recall_k is not None else self._resolve_recall_k(top_k),
+        )
+        with trace.stage("knowledge.vector_recall"):
+            vector_hits = self._vector_recall(query, top_n=resolved_recall_k)
+        with trace.stage("knowledge.bm25_recall"):
+            bm25_hits = self._bm25_recall(query, top_n=resolved_recall_k)
+        with trace.stage("knowledge.rrf_fuse"):
+            fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=resolved_recall_k)
+        with trace.stage("knowledge.rerank"):
+            reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
+        with trace.stage("knowledge.attach_parent_context"):
+            return self._attach_parent_context(reranked)
+
     @property
     def doc_count(self) -> int:
         parent_collection = getattr(self, "_parent_collection", None)
@@ -219,7 +244,10 @@ class KnowledgeBase:
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
         recall_k = params.get("recall_k")
-        return self.search(query, top_k=top_k, recall_k=recall_k)
+        trace = None
+        if isinstance(context, dict):
+            trace = context.get("trace")
+        return self.search_with_trace(query, top_k=top_k, recall_k=recall_k, trace=trace)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
