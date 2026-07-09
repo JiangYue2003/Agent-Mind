@@ -38,3 +38,8 @@ docker-compose(1).yml
 
 #具体配置
 .env
+/docs/customer-service-kb/
+/knowledges/Typora_Hook_Log.txt
+/日常开发流程.md
+/Typora_Hook_Log.txt
+/docker-compose.dev.yml

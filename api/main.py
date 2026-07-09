@@ -9,6 +9,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -52,13 +53,18 @@ _monitor      = None
 _evaluator    = None
 _chat_intent_recognizer = None
 _trace_store  = None
+_action_planner = None
+_slot_manager = None
+_state_machine = None
 _mock_handoff_records: List[Dict[str, Any]] = []
+_mock_refund_records: Dict[str, Dict[str, Any]] = {}
 
 _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
     "ORD20250701001": {
         "order_id": "ORD20250701001",
         "user_id": "u123",
         "status": "运输中",
+        "amount": "99.00",
         "payment_status": "已支付",
         "shipment_status": "运输中",
         "refund_status": "",
@@ -69,11 +75,49 @@ _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
         "order_id": "ORD20250701002",
         "user_id": "u456",
         "status": "已退款",
+        "amount": "199.00",
         "payment_status": "已支付",
         "shipment_status": "未发货",
         "refund_status": "退款成功",
         "updated_at": "2026-07-02T09:00:00+08:00",
         "source": "mock_oms",
+    },
+    "ORD20250701003": {
+        "order_id": "ORD20250701003",
+        "user_id": "u123",
+        "status": "已支付",
+        "amount": "59.90",
+        "payment_status": "已支付",
+        "shipment_status": "待发货",
+        "refund_status": "",
+        "updated_at": "2026-07-02T11:15:00+08:00",
+        "source": "mock_oms",
+    },
+}
+
+_MOCK_SHIPMENT_DATA: Dict[str, Dict[str, Any]] = {
+    "ORD20250701001": {
+        "order_id": "ORD20250701001",
+        "user_id": "u123",
+        "carrier": "顺丰速运",
+        "tracking_no": "SF1234567890",
+        "shipment_status": "运输中",
+        "events": [
+            {"time": "2026-07-02 12:00:00", "status": "商家已发货"},
+            {"time": "2026-07-03 09:30:00", "status": "快件运输中"},
+        ],
+        "source": "mock_tms",
+    },
+    "ORD20250701002": {
+        "order_id": "ORD20250701002",
+        "user_id": "u456",
+        "carrier": "圆通速递",
+        "tracking_no": "YT9988776655",
+        "shipment_status": "未发货",
+        "events": [
+            {"time": "2026-07-02 09:00:00", "status": "订单已取消，无需发货"},
+        ],
+        "source": "mock_tms",
     },
 }
 
@@ -103,6 +147,7 @@ def _ensure_trace_store():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer, _trace_store
+    global _action_planner, _slot_manager, _state_machine
 
     print(BANNER, flush=True)
 
@@ -112,10 +157,15 @@ async def lifespan(app: FastAPI):
     from mcp.handoff_service import HumanHandoffService
     from mcp.knowledge_base import KnowledgeBase
     from mcp.order_lookup import OrderLookupService
+    from mcp.refund_create import RefundCreateService
+    from mcp.shipment_track import ShipmentTrackService
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from telemetry.runtime import TraceStore
+    from workflow.action_planner import ActionPlanner
+    from workflow.slot_manager import SlotManager
+    from workflow.state_machine import WorkflowStateMachine
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -128,6 +178,9 @@ async def lifespan(app: FastAPI):
     )
     _chat_intent_recognizer = recognizer
     _trace_store = TraceStore(capacity=int(os.getenv("TRACE_STORE_CAPACITY", "200")))
+    _slot_manager = SlotManager()
+    _action_planner = ActionPlanner(slot_manager=_slot_manager)
+    _state_machine = WorkflowStateMachine(max_action_steps=3)
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
@@ -159,6 +212,8 @@ async def lifespan(app: FastAPI):
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
     )
     order_lookup = OrderLookupService(base_url=os.getenv("ORDER_LOOKUP_BASE_URL", "http://localhost:8000"))
+    shipment_track = ShipmentTrackService(base_url=os.getenv("SHIPMENT_TRACK_BASE_URL", "http://localhost:8000"))
+    refund_create = RefundCreateService(base_url=os.getenv("REFUND_CREATE_BASE_URL", "http://localhost:8000"))
     handoff_service = HumanHandoffService(base_url=os.getenv("HANDOFF_BASE_URL", "http://localhost:8000"))
     logger.info(f"知识库已加载: {kb.doc_count} 个文档片段")
 
@@ -201,6 +256,34 @@ async def lifespan(app: FastAPI):
             "required": ["user_id", "order_id"],
         },
         cache_ttl=30.0,
+    ))
+    _tool_manager.register(Tool(
+        name="shipment_track",
+        description="查询物流轨迹（通过外部物流接口）",
+        handler=shipment_track.track_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "order_id": {"type": "string"},
+            },
+            "required": ["user_id", "order_id"],
+        },
+        cache_ttl=15.0,
+    ))
+    _tool_manager.register(Tool(
+        name="refund_create",
+        description="提交退款申请（通过外部售后接口）",
+        handler=refund_create.create_handler,
+        schema={
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "order_id": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+            "required": ["user_id", "order_id"],
+        },
     ))
     _tool_manager.register(Tool(
         name="human_handoff",
@@ -305,12 +388,21 @@ async def chat(req: ChatRequest):
         raise HTTPException(503, "服务未就绪")
 
     from agents.agent_orchestrator import Request as OrcReq
+    from agents.agent_orchestrator import AgentType
     from memory.conversation_memory import MsgRole
     from telemetry.runtime import TraceContext
+    from workflow.state_machine import WorkflowState
 
     conv_id = req.conv_id or str(uuid.uuid4())
     trace = TraceContext(user_id=req.user_id, conv_id=conv_id, message=req.message)
     trace_store = _ensure_trace_store()
+    response_text = ""
+    response_agent_type = AgentType.GENERAL
+    response_intent = None
+    response_escalated = False
+    knowledge_used = False
+    response_latency_ms = 0.0
+    t0 = time.monotonic()
 
     try:
         with trace.stage("chat.total"):
@@ -326,35 +418,76 @@ async def chat(req: ChatRequest):
 
             with trace.stage("intent.recognize"):
                 intent_result = await _recognize_chat_intent(req.message, history)
-            with trace.stage("knowledge_context.build"):
-                knowledge_text, knowledge_used = await _build_knowledge_context(req.message, context={"trace": trace})
-            context_parts = [mem_ctx.to_prompt_text()]
-            if knowledge_text:
-                context_parts.append(knowledge_text)
-            with trace.stage("tool_augment.build"):
-                tool_text = await _build_tool_context(req, conv_id, mem_ctx, intent_result, trace=trace)
-            if tool_text:
-                context_parts.append(tool_text)
-            full_context = "\n\n".join(part for part in context_parts if part)
 
-            orch_req = OrcReq(
-                message=req.message,
-                user_id=req.user_id,
-                conv_id=conv_id,
-                context=full_context,
-                history=history,
-                intent=intent_result.intent if intent_result else None,
-                urgency=intent_result.urgency if intent_result else None,
-            )
+            with trace.stage("workflow.slot_check"):
+                slot_assessment = _get_slot_manager().assess(
+                    message=req.message,
+                    intent=intent_result.intent if intent_result else None,
+                    entities=getattr(intent_result, "entities", {}) if intent_result else {},
+                )
+                trace._stages[-1].meta["slot_check"] = slot_assessment.to_dict()
 
-            # 3. 执行
-            with trace.stage("orchestrator.run"):
-                result = await _orchestrator.run(orch_req, context={"trace": trace})
+            with trace.stage("workflow.planner"):
+                action_plan = _get_action_planner().plan(
+                    message=req.message,
+                    intent=intent_result.intent if intent_result else None,
+                    entities=getattr(intent_result, "entities", {}) if intent_result else {},
+                    slot_assessment=slot_assessment,
+                    intent_confidence=getattr(intent_result, "confidence", 0.0) if intent_result else 0.0,
+                    intent_reasoning=getattr(intent_result, "reasoning", "") if intent_result else "",
+                )
+                trace._stages[-1].meta["plan"] = action_plan.to_dict()
+
+            with trace.stage("workflow.state_transition"):
+                workflow_path = _get_state_machine().build_path(action_plan)
+                trace._stages[-1].meta["path"] = workflow_path.to_dict()
+
+            response_intent = intent_result.intent if intent_result else None
+            response_agent_type = _agent_type_for_intent(response_intent, action_plan)
+            response_escalated = action_plan.need_handoff
+
+            if workflow_path.includes(WorkflowState.CLARIFY):
+                response_text = action_plan.clarify_prompt or slot_assessment.clarify_question or "为了继续帮你处理，请补充关键信息。"
+            else:
+                context_parts = [mem_ctx.to_prompt_text()]
+                execution_result = await _execute_workflow_plan(
+                    action_plan,
+                    req,
+                    conv_id,
+                    mem_ctx,
+                    intent_result,
+                    trace=trace,
+                )
+                knowledge_used = execution_result.knowledge_used
+                if execution_result.context_blocks:
+                    context_parts.extend(execution_result.context_blocks)
+
+                full_context = "\n\n".join(part for part in context_parts if part)
+
+                orch_req = OrcReq(
+                    message=req.message,
+                    user_id=req.user_id,
+                    conv_id=conv_id,
+                    context=full_context,
+                    history=history,
+                    intent=intent_result.intent if intent_result else None,
+                    urgency=intent_result.urgency if intent_result else None,
+                )
+
+                # 3. 执行
+                with trace.stage("orchestrator.run"):
+                    result = await _run_planned_orchestrator(orch_req, action_plan, trace=trace)
+                response_text = result.response
+                if not action_plan.need_handoff:
+                    response_agent_type = result.agent_type
+                response_intent = result.intent
+                response_escalated = result.escalated or action_plan.need_handoff
+                response_latency_ms = result.latency_ms
 
             # 4. 写入记忆
             with trace.stage("memory.write"):
                 await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
-                await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, result.response)
+                await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, response_text)
 
             # 5. 异步更新用户画像（不阻塞响应）
             with trace.stage("profile_update.schedule"):
@@ -366,14 +499,16 @@ async def chat(req: ChatRequest):
 
     trace.finalize(success=True)
     trace_store.save(trace)
+    if response_latency_ms <= 0:
+        response_latency_ms = (time.monotonic() - t0) * 1000
 
     return ChatResponse(
         conv_id=conv_id,
-        response=result.response,
-        intent=result.intent.value if result.intent else "other",
-        agent_type=result.agent_type.value,
-        escalated=result.escalated,
-        latency_ms=round(result.latency_ms, 1),
+        response=response_text,
+        intent=response_intent.value if response_intent else "other",
+        agent_type=response_agent_type.value,
+        escalated=response_escalated,
+        latency_ms=round(response_latency_ms, 1),
         knowledge_used=knowledge_used,
         trace_id=trace.trace_id,
     )
@@ -443,11 +578,258 @@ async def _recognize_chat_intent(message: str, history: Optional[List[Dict[str, 
         return None
 
 
+async def _execute_workflow_plan(
+    plan: Any,
+    req: ChatRequest,
+    conv_id: str,
+    mem_ctx: Any,
+    intent_result: Any,
+    trace: Any = None,
+):
+    from workflow.action_executor import ActionExecutor
+
+    executor = ActionExecutor(_build_workflow_tool_registry())
+    runtime = {
+        "message": req.message,
+        "req": req,
+        "conv_id": conv_id,
+        "mem_ctx": mem_ctx,
+        "intent_result": intent_result,
+        "trace": trace,
+        "entities": getattr(intent_result, "entities", {}) if intent_result else {},
+    }
+    if trace is None:
+        result = await executor.execute(plan, runtime=runtime)
+    else:
+        with trace.stage("workflow.execute"):
+            result = await executor.execute(plan, runtime=runtime)
+        with trace.stage("workflow.verify"):
+            trace._stages[-1].meta["evidence_keys"] = list(result.evidence_store.items.keys())
+            trace._stages[-1].meta["failed_actions"] = list(result.failed_actions)
+            trace._stages[-1].meta["degraded"] = result.degraded
+    return result
+
+
+def _build_workflow_tool_registry():
+    from workflow.action_models import ActionType, EvidenceItem
+    from workflow.tool_registry import ToolRegistry
+
+    registry = ToolRegistry()
+
+    async def _retrieve_policy(action, runtime, evidence_store):
+        trace = runtime.get("trace")
+        ctx = {"trace": trace} if trace is not None else None
+        if trace is None:
+            text, used = await _build_knowledge_context(runtime["message"], context=ctx)
+        else:
+            with trace.stage("knowledge_context.build"):
+                text, used = await _build_knowledge_context(runtime["message"], context=ctx)
+        if not used or not text:
+            return None
+        return EvidenceItem(
+            key=action.output_key or "knowledge.policy",
+            source="knowledge_search",
+            value={"used": used, "text": text},
+            prompt_block=text,
+            tool_name="knowledge_search",
+        )
+
+    async def _lookup_order(action, runtime, evidence_store):
+        payload = await _maybe_lookup_order(
+            runtime["req"],
+            runtime["intent_result"],
+            force=True,
+            trace=runtime.get("trace"),
+        )
+        if payload is None:
+            return None
+        return EvidenceItem(
+            key=action.output_key or "order.snapshot",
+            source="order_lookup",
+            value=payload,
+            prompt_block=_format_order_lookup_context(payload),
+            tool_name="order_lookup",
+        )
+
+    async def _track_shipment(action, runtime, evidence_store):
+        payload = await _maybe_track_shipment(
+            runtime["req"],
+            runtime["intent_result"],
+            force=True,
+            trace=runtime.get("trace"),
+        )
+        if payload is None:
+            return None
+        return EvidenceItem(
+            key=action.output_key or "shipment.snapshot",
+            source="shipment_track",
+            value=payload,
+            prompt_block=_format_shipment_context(payload),
+            tool_name="shipment_track",
+        )
+
+    async def _create_refund(action, runtime, evidence_store):
+        payload = await _maybe_create_refund(
+            runtime["req"],
+            runtime["intent_result"],
+            force=True,
+            trace=runtime.get("trace"),
+        )
+        if payload is None:
+            return None
+        return EvidenceItem(
+            key=action.output_key or "refund.result",
+            source="refund_create",
+            value=payload,
+            prompt_block=_format_refund_create_context(payload),
+            tool_name="refund_create",
+        )
+
+    async def _create_handoff(action, runtime, evidence_store):
+        order_item = evidence_store.get("order.snapshot")
+        payload = await _maybe_handoff(
+            runtime["req"],
+            runtime["conv_id"],
+            runtime["mem_ctx"],
+            runtime["intent_result"],
+            order_item.value if order_item else None,
+            force=True,
+            trace=runtime.get("trace"),
+        )
+        if payload is None:
+            return None
+        return EvidenceItem(
+            key=action.output_key or "handoff.result",
+            source="human_handoff",
+            value=payload,
+            prompt_block=_format_handoff_context(payload),
+            tool_name="human_handoff",
+        )
+
+    async def _synthesize(action, runtime, evidence_store):
+        return EvidenceItem(
+            key=action.output_key or "final.answer",
+            source="workflow",
+            value={"status": "ready", "input_keys": list(action.input_keys)},
+        )
+
+    registry.register(ActionType.RETRIEVE_POLICY, _retrieve_policy)
+    registry.register(ActionType.RETRIEVE_FAQ, _retrieve_policy)
+    registry.register(ActionType.LOOKUP_ORDER, _lookup_order)
+    registry.register(ActionType.TRACK_SHIPMENT, _track_shipment)
+    registry.register(ActionType.CREATE_REFUND, _create_refund)
+    registry.register(ActionType.CREATE_HANDOFF, _create_handoff)
+    registry.register(ActionType.SYNTHESIZE_ANSWER, _synthesize)
+    registry.register(ActionType.SYNTHESIZE_MULTI_AGENT, _synthesize)
+    registry.register(ActionType.CLARIFY_SLOT, _synthesize)
+    registry.register(ActionType.DECIDE_HANDOFF, _synthesize)
+    return registry
+
+
+async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None):
+    from agents.agent_orchestrator import OrchestratorResult, Request as OrcReq
+
+    route_plan = getattr(plan, "route_plan", None)
+    if _orchestrator is None or route_plan is None or not getattr(route_plan, "supporting_agents", []):
+        return await _orchestrator.run(orch_req, context={"trace": trace} if trace is not None else None)
+
+    overall_t0 = time.monotonic()
+    supporting_agent_types = [_agent_type_from_role(agent) for agent in route_plan.supporting_agents]
+    if getattr(route_plan, "merge_mode", None) and getattr(route_plan.merge_mode, "value", "") == "parallel_sections":
+        agent_types = [_agent_type_from_role(route_plan.primary_agent)] + supporting_agent_types
+        return await _orchestrator.run_parallel(orch_req, agent_types, context={"trace": trace} if trace is not None else None)
+
+    primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
+    support_blocks = []
+    escalated = False
+    if trace is None:
+        support_results = await asyncio.gather(
+            *[
+                _orchestrator._execute(_build_supporting_agent_request(orch_req, agent_type), agent_type, context=None)
+                for agent_type in supporting_agent_types
+            ],
+            return_exceptions=True,
+        )
+    else:
+        with trace.stage("orchestrator.supporting_agents"):
+            support_results = await asyncio.gather(
+                *[
+                    _orchestrator._execute(
+                        _build_supporting_agent_request(orch_req, agent_type),
+                        agent_type,
+                        context={"trace": trace},
+                    )
+                    for agent_type in supporting_agent_types
+                ],
+                return_exceptions=True,
+            )
+    for result in support_results:
+        if isinstance(result, Exception) or not getattr(result, "success", False):
+            continue
+        support_blocks.append(f"[{result.agent_type.value} 结构化意见]\n{result.content}")
+        escalated = escalated or bool(getattr(result, "escalate", False))
+
+    primary_context = orch_req.context
+    if support_blocks:
+        primary_context = "\n\n".join([orch_req.context, "[辅助专家结构化意见]", *support_blocks])
+
+    primary_req = OrcReq(
+        message=orch_req.message,
+        user_id=orch_req.user_id,
+        conv_id=orch_req.conv_id,
+        context=primary_context,
+        history=orch_req.history,
+        intent=orch_req.intent,
+        urgency=orch_req.urgency,
+        request_id=orch_req.request_id,
+    )
+
+    if trace is None:
+        primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context=None)
+    else:
+        with trace.stage("orchestrator.primary_summarize", primary_agent=primary_agent_type.value):
+            primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context={"trace": trace})
+
+    escalated = escalated or bool(getattr(primary_response, "escalate", False))
+    return OrchestratorResult(
+        request_id=primary_req.request_id,
+        response=primary_response.content,
+        agent_type=primary_response.agent_type,
+        intent=primary_req.intent,
+        escalated=escalated,
+        latency_ms=(time.monotonic() - overall_t0) * 1000,
+    )
+
+
+def _build_supporting_agent_request(orch_req: Any, agent_type: Any):
+    from agents.agent_orchestrator import Request as OrcReq
+
+    role_name = getattr(agent_type, "value", str(agent_type))
+    structured_prompt = (
+        f"你现在是 {role_name} 辅助专家，不直接面向用户回复，也不要给寒暄。"
+        "请仅基于当前问题和背景信息，输出结构化辅助意见，严格使用以下四段标题："
+        "[问题判断]、[关键事实]、[风险与限制]、[建议动作]。"
+        "只写你本专业负责的判断，不要越权承诺操作。"
+        f"\n\n用户原始问题：{orch_req.message}"
+    )
+    return OrcReq(
+        message=structured_prompt,
+        user_id=orch_req.user_id,
+        conv_id=orch_req.conv_id,
+        context=orch_req.context,
+        history=orch_req.history,
+        intent=orch_req.intent,
+        urgency=orch_req.urgency,
+        request_id=orch_req.request_id,
+    )
+
+
 async def _build_tool_context(
     req: ChatRequest,
     conv_id: str,
     mem_ctx: Any,
     intent_result: Any,
+    plan: Any = None,
     trace: Any = None,
 ) -> str:
     if _tool_manager is None or intent_result is None:
@@ -457,17 +839,24 @@ async def _build_tool_context(
     skipped_tools: List[str] = []
     sections: List[str] = []
 
-    order_snapshot = await _maybe_lookup_order(req, intent_result, trace=trace)
-    if order_snapshot is not None:
-        called_tools.append("order_lookup")
-        sections.append(_format_order_lookup_context(order_snapshot))
+    order_snapshot = None
+    if plan is not None and getattr(plan, "need_order_lookup", False):
+        order_snapshot = await _maybe_lookup_order(req, intent_result, force=True, trace=trace)
+        if order_snapshot is not None:
+            called_tools.append("order_lookup")
+            sections.append(_format_order_lookup_context(order_snapshot))
+        else:
+            skipped_tools.append("order_lookup")
     else:
         skipped_tools.append("order_lookup")
 
-    handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot, trace=trace)
-    if handoff_result is not None:
-        called_tools.append("human_handoff")
-        sections.append(_format_handoff_context(handoff_result))
+    if plan is not None and getattr(plan, "need_handoff", False):
+        handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot, force=True, trace=trace)
+        if handoff_result is not None:
+            called_tools.append("human_handoff")
+            sections.append(_format_handoff_context(handoff_result))
+        else:
+            skipped_tools.append("human_handoff")
     else:
         skipped_tools.append("human_handoff")
 
@@ -477,7 +866,7 @@ async def _build_tool_context(
     summary = ["[工具增强上下文]", "", "[工具执行摘要]"]
     summary.append(f"- 已调用工具: {', '.join(called_tools) if called_tools else '无'}")
     summary.append(f"- 未调用工具: {', '.join(skipped_tools) if skipped_tools else '无'}")
-    summary.append("- 事实优先级: 订单实时状态优先于通用知识说明；人工转接结果优先于推测性答复")
+    summary.append("- 事实优先级: 实时订单/物流/退款结果优先于通用知识说明；人工转接结果优先于推测性答复")
     return "\n".join(summary + [""] + sections)
 
 
@@ -498,34 +887,104 @@ def _extract_order_id(intent_result: Any) -> str:
     return str(order_ids[0]).strip()
 
 
-async def _maybe_lookup_order(req: ChatRequest, intent_result: Any, trace: Any = None) -> Optional[Dict[str, Any]]:
+def _extract_refund_reason(message: str) -> str:
+    msg = (message or "").strip()
+    markers = ("原因是", "因为", "理由是")
+    for marker in markers:
+        if marker in msg:
+            return msg.split(marker, 1)[1].strip(" ：:，,。")
+    return ""
+
+
+def _looks_like_shipment_query(message: str) -> bool:
+    msg = (message or "").lower()
+    keywords = ["物流", "快递", "配送", "发货", "运输", "tracking", "shipment", "delivery"]
+    return any(kw in msg for kw in keywords)
+
+
+def _looks_like_refund_create(message: str) -> bool:
+    msg = (message or "").lower()
+    action_keywords = ["我要退款", "申请退款", "帮我退款", "退款一下", "给我退款", "直接退款"]
+    return any(kw in msg for kw in action_keywords)
+
+
+async def _call_business_tool(
+    tool_name: str,
+    params: Dict[str, Any],
+    trace: Any = None,
+) -> Optional[Any]:
+    try:
+        stage = trace.stage(f"tool.{tool_name}") if trace is not None else None
+        if stage is None:
+            result = await _tool_manager.call(tool_name, params)
+        else:
+            with stage:
+                result = await _tool_manager.call(tool_name, params, context={"trace": trace})
+    except Exception as ex:
+        logger.warning(f"{tool_name} 调用失败: {ex}")
+        return {"status": "failed", "error": str(ex), **params}
+
+    if not result.success or not isinstance(result.data, dict):
+        return {"status": "failed", "error": result.error or "tool_failed", **params}
+    return result.data
+
+
+async def _maybe_lookup_order(
+    req: ChatRequest,
+    intent_result: Any,
+    force: bool = False,
+    trace: Any = None,
+) -> Optional[Dict[str, Any]]:
     order_id = _extract_order_id(intent_result)
     if not order_id:
         return None
-    if not _looks_like_order_query(req.message):
+    if not force and not _looks_like_order_query(req.message):
         return None
+    return await _call_business_tool(
+        "order_lookup",
+        {"user_id": req.user_id, "order_id": order_id},
+        trace=trace,
+    )
 
-    try:
-        stage = trace.stage("tool.order_lookup") if trace is not None else None
-        if stage is None:
-            result = await _tool_manager.call(
-                "order_lookup",
-                {"user_id": req.user_id, "order_id": order_id},
-            )
-        else:
-            with stage:
-                result = await _tool_manager.call(
-                    "order_lookup",
-                    {"user_id": req.user_id, "order_id": order_id},
-                    context={"trace": trace},
-                )
-    except Exception as ex:
-        logger.warning(f"order_lookup 调用失败: {ex}")
-        return {"status": "failed", "error": str(ex), "order_id": order_id}
 
-    if not result.success or not isinstance(result.data, dict):
-        return {"status": "failed", "error": result.error or "tool_failed", "order_id": order_id}
-    return result.data
+async def _maybe_track_shipment(
+    req: ChatRequest,
+    intent_result: Any,
+    force: bool = False,
+    trace: Any = None,
+) -> Optional[Dict[str, Any]]:
+    order_id = _extract_order_id(intent_result)
+    if not order_id:
+        return None
+    if not force and not _looks_like_shipment_query(req.message):
+        return None
+    return await _call_business_tool(
+        "shipment_track",
+        {"user_id": req.user_id, "order_id": order_id},
+        trace=trace,
+    )
+
+
+async def _maybe_create_refund(
+    req: ChatRequest,
+    intent_result: Any,
+    force: bool = False,
+    trace: Any = None,
+) -> Optional[Dict[str, Any]]:
+    order_id = _extract_order_id(intent_result)
+    if not order_id:
+        return None
+    if not force and not _looks_like_refund_create(req.message):
+        return None
+    return await _call_business_tool(
+        "refund_create",
+        {
+            "user_id": req.user_id,
+            "order_id": order_id,
+            "reason": _extract_refund_reason(req.message),
+        },
+        trace=trace,
+    )
 
 
 def _should_handoff(message: str, intent_result: Any) -> bool:
@@ -543,9 +1002,10 @@ async def _maybe_handoff(
     mem_ctx: Any,
     intent_result: Any,
     order_snapshot: Optional[Dict[str, Any]],
+    force: bool = False,
     trace: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    if not _should_handoff(req.message, intent_result):
+    if not force and not _should_handoff(req.message, intent_result):
         return None
 
     recent_messages = []
@@ -610,6 +1070,54 @@ def _format_order_lookup_context(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_shipment_context(payload: Dict[str, Any]) -> str:
+    lines = ["[shipment_track]"]
+    shipment_status = str(payload.get("shipment_status", "")).strip() or "unknown"
+    lines.append(f"- 物流状态: {shipment_status}")
+    order_id = str(payload.get("order_id", "")).strip()
+    if order_id:
+        lines.append(f"- 订单号: {order_id}")
+    carrier = str(payload.get("carrier", "")).strip()
+    if carrier:
+        lines.append(f"- 承运商: {carrier}")
+    tracking_no = str(payload.get("tracking_no", "")).strip()
+    if tracking_no:
+        lines.append(f"- 运单号: {tracking_no}")
+    events = payload.get("events") or []
+    if events:
+        latest = events[-1]
+        lines.append(f"- 最新轨迹: {latest.get('time', '')} {latest.get('status', '')}".strip())
+    error = str(payload.get("error", "")).strip()
+    if error:
+        lines.append(f"- 错误信息: {error}")
+    return "\n".join(lines)
+
+
+def _format_refund_create_context(payload: Dict[str, Any]) -> str:
+    lines = ["[refund_create]"]
+    status = str(payload.get("status", "")).strip() or "unknown"
+    lines.append(f"- 申请状态: {status}")
+    refund_id = str(payload.get("refund_id", "")).strip()
+    if refund_id:
+        lines.append(f"- 退款单号: {refund_id}")
+    order_id = str(payload.get("order_id", "")).strip()
+    if order_id:
+        lines.append(f"- 订单号: {order_id}")
+    amount = str(payload.get("amount", "")).strip()
+    if amount:
+        lines.append(f"- 退款金额: {amount}")
+    reason = str(payload.get("reason", "")).strip()
+    if reason:
+        lines.append(f"- 退款原因: {reason}")
+    submitted_at = str(payload.get("submitted_at", "")).strip()
+    if submitted_at:
+        lines.append(f"- 提交时间: {submitted_at}")
+    error = str(payload.get("error", "")).strip()
+    if error:
+        lines.append(f"- 错误信息: {error}")
+    return "\n".join(lines)
+
+
 def _format_handoff_context(payload: Dict[str, Any]) -> str:
     lines = ["[human_handoff]"]
     status = str(payload.get("status", "")).strip() or "unknown"
@@ -645,6 +1153,59 @@ def _should_use_knowledge(message: str) -> bool:
     return len(msg) >= 4 or any(kw in msg for kw in business_keywords)
 
 
+def _get_slot_manager():
+    global _slot_manager
+    if _slot_manager is None:
+        from workflow.slot_manager import SlotManager
+        _slot_manager = SlotManager()
+    return _slot_manager
+
+
+def _get_action_planner():
+    global _action_planner
+    if _action_planner is None:
+        from workflow.action_planner import ActionPlanner
+        _action_planner = ActionPlanner(slot_manager=_get_slot_manager())
+    return _action_planner
+
+
+def _get_state_machine():
+    global _state_machine
+    if _state_machine is None:
+        from workflow.state_machine import WorkflowStateMachine
+        _state_machine = WorkflowStateMachine(max_action_steps=3)
+    return _state_machine
+
+
+def _agent_type_for_intent(intent: Any, action_plan: Any):
+    from agents.agent_orchestrator import AgentType
+    from core.intent_recognizer import IntentCategory
+
+    route_plan = getattr(action_plan, "route_plan", None)
+    if route_plan is not None and getattr(route_plan, "primary_agent", None):
+        return _agent_type_from_role(route_plan.primary_agent)
+    if getattr(action_plan, "need_handoff", False):
+        return AgentType.ESCALATION
+    if intent == IntentCategory.TECHNICAL:
+        return AgentType.TECHNICAL
+    if intent in {IntentCategory.BILLING, IntentCategory.ACCOUNT}:
+        return AgentType.BILLING
+    return AgentType.GENERAL
+
+
+def _agent_type_from_role(role: Any):
+    from agents.agent_orchestrator import AgentType
+
+    value = getattr(role, "value", str(role))
+    mapping = {
+        "general": AgentType.GENERAL,
+        "technical": AgentType.TECHNICAL,
+        "billing": AgentType.BILLING,
+        "escalation": AgentType.ESCALATION,
+    }
+    return mapping.get(value, AgentType.GENERAL)
+
+
 @app.get("/monitor")
 async def monitor_summary():
     """实时监控摘要：Agent 成功率、工具统计、告警、优化建议。"""
@@ -668,13 +1229,53 @@ async def get_trace(trace_id: str):
     return payload
 
 
+def _get_owned_mock_record(store: Dict[str, Dict[str, Any]], resource_id: str, user_id: str) -> Dict[str, Any]:
+    record = store.get(resource_id)
+    if record is None or str(record.get("user_id", "")).strip() != str(user_id).strip():
+        raise HTTPException(404, "资源不存在")
+    return record
+
+
 @app.get("/mock/external/orders/{order_id}", tags=["Mock External"])
 async def mock_external_order_lookup(order_id: str, user_id: str):
-    record = _MOCK_ORDER_DATA.get(order_id)
-    if record is None:
-        raise HTTPException(404, "订单不存在")
-    if record.get("user_id") != user_id:
-        raise HTTPException(403, "无权查看该订单")
+    record = _get_owned_mock_record(_MOCK_ORDER_DATA, order_id, user_id)
+    return dict(record)
+
+
+@app.get("/mock/external/shipments/{order_id}", tags=["Mock External"])
+async def mock_external_shipment_track(order_id: str, user_id: str):
+    record = _get_owned_mock_record(_MOCK_SHIPMENT_DATA, order_id, user_id)
+    return dict(record)
+
+
+class MockRefundCreateInput(BaseModel):
+    user_id: str
+    order_id: str
+    reason: Optional[str] = ""
+
+
+@app.post("/mock/external/refunds", tags=["Mock External"])
+async def mock_external_refund_create(body: MockRefundCreateInput):
+    order_record = _get_owned_mock_record(_MOCK_ORDER_DATA, body.order_id, body.user_id)
+    existing = _mock_refund_records.get(body.order_id)
+    if existing is not None and existing.get("user_id") == body.user_id:
+        return dict(existing)
+
+    submitted_at = datetime.now(timezone.utc).astimezone().isoformat()
+    record = {
+        "refund_id": f"RF{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+        "order_id": body.order_id,
+        "user_id": body.user_id,
+        "status": "submitted",
+        "amount": order_record.get("amount", ""),
+        "reason": body.reason or "",
+        "submitted_at": submitted_at,
+        "source": "mock_refund",
+    }
+    _mock_refund_records[body.order_id] = record
+
+    order_record["refund_status"] = "退款申请已提交"
+    order_record["updated_at"] = submitted_at
     return dict(record)
 
 

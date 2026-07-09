@@ -163,9 +163,15 @@ class TracePipelineTests(unittest.TestCase):
         self.assertIn("chat.total", stage_names)
         self.assertIn("memory.read", stage_names)
         self.assertIn("intent.recognize", stage_names)
+        self.assertIn("workflow.slot_check", stage_names)
+        self.assertIn("workflow.planner", stage_names)
+        self.assertIn("workflow.state_transition", stage_names)
         self.assertIn("knowledge_context.build", stage_names)
         self.assertIn("orchestrator.run", stage_names)
         self.assertIn("memory.write", stage_names)
+
+        planner_stage = next(item for item in trace_payload["stages"] if item["name"] == "workflow.planner")
+        self.assertEqual(planner_stage["meta"]["plan"]["next_action"], "retrieve")
 
     def test_trace_records_knowledge_substages(self):
         response = asyncio.run(api_main.chat(api_main.ChatRequest(

@@ -259,7 +259,7 @@ class AgentOrchestrator:
         # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
         collaboration = self._collaboration_targets(req)
         if len(collaboration) > 1:
-            return await self.run_parallel(req, collaboration)
+            return await self.run_parallel(req, collaboration, context=context)
 
         # 2. 路由：选择 Agent 类型
         if trace is None:
@@ -297,13 +297,18 @@ class AgentOrchestrator:
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    async def run_parallel(self, req: Request, agent_types: List[AgentType]) -> OrchestratorResult:
+    async def run_parallel(
+        self,
+        req: Request,
+        agent_types: List[AgentType],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> OrchestratorResult:
         """
         并行派发给多个 Agent，合并结果。
         适用于复杂问题（如同时涉及技术和账单）。
         """
         t0 = time.monotonic()
-        tasks = [self._execute(req, at) for at in agent_types]
+        tasks = [self._execute(req, at, context=context) for at in agent_types]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 合并：拼接所有成功响应
@@ -376,7 +381,12 @@ class AgentOrchestrator:
             return None
         return max(agents, key=lambda a: a.stats.routing_score())
 
-    async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
+    async def _execute(
+        self,
+        req: Request,
+        agent_type: AgentType,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
         """执行 Agent，失败时降级到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
@@ -391,40 +401,14 @@ class AgentOrchestrator:
         response = await agent.handle(req, context=context)
 
         # 专属 Agent 失败时降级到 GeneralAgent
+        fallback = None
         if not response.success and agent_type != AgentType.GENERAL:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
-            if fallback:
-                response = await fallback.handle(req, context=context)
+        if fallback:
+            response = await fallback.handle(req, context=context)
 
         return response
-
-
-def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
-    usage = getattr(resp, "usage", None)
-    if usage is None:
-        return {}
-
-    result: Dict[str, Any] = {}
-    for key in [
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "prompt_cache_hit_tokens",
-        "prompt_cache_miss_tokens",
-    ]:
-        value = getattr(usage, key, None)
-        if value is not None:
-            result[key] = value
-
-    details = getattr(usage, "completion_tokens_details", None)
-    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
-    if reasoning_tokens is not None:
-        result["reasoning_tokens"] = reasoning_tokens
-
-    return result
-
-    # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, Any]:
         result = {}
@@ -451,3 +435,28 @@ def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
                 key = f"{agent_type.value}_{i}"
                 penalty = penalties.get(key, 0.0)
                 agent.stats.monitor_penalty = min(max(penalty, 0.0), 0.9)
+
+
+def _extract_usage_dict(resp: Any) -> Dict[str, Any]:
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {}
+
+    result: Dict[str, Any] = {}
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ]:
+        value = getattr(usage, key, None)
+        if value is not None:
+            result[key] = value
+
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details is not None else None
+    if reasoning_tokens is not None:
+        result["reasoning_tokens"] = reasoning_tokens
+
+    return result

@@ -40,6 +40,68 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "运输中")
         self.assertEqual(result["source"], "mock_oms")
 
+    async def test_order_lookup_hides_other_users_order(self):
+        from mcp.order_lookup import OrderLookupService
+
+        client = TestClient(api_main.app)
+        transport = httpx.ASGITransport(app=api_main.app)
+        service = OrderLookupService(base_url=str(client.base_url), transport=transport)
+
+        with self.assertRaises(httpx.HTTPStatusError) as ctx:
+            await service.lookup_handler(
+                {"user_id": "u999", "order_id": "ORD20250701001"},
+                context=None,
+            )
+
+        self.assertEqual(ctx.exception.response.status_code, 404)
+
+    async def test_shipment_track_calls_mock_external_logistics_service(self):
+        from mcp.shipment_track import ShipmentTrackService
+
+        client = TestClient(api_main.app)
+        transport = httpx.ASGITransport(app=api_main.app)
+        service = ShipmentTrackService(base_url=str(client.base_url), transport=transport)
+
+        result = await service.track_handler(
+            {"user_id": "u123", "order_id": "ORD20250701001"},
+            context=None,
+        )
+
+        self.assertEqual(result["order_id"], "ORD20250701001")
+        self.assertEqual(result["carrier"], "顺丰速运")
+        self.assertGreaterEqual(len(result["events"]), 1)
+
+    async def test_refund_create_requires_order_ownership(self):
+        from mcp.refund_create import RefundCreateService
+
+        client = TestClient(api_main.app)
+        transport = httpx.ASGITransport(app=api_main.app)
+        service = RefundCreateService(base_url=str(client.base_url), transport=transport)
+
+        with self.assertRaises(httpx.HTTPStatusError) as ctx:
+            await service.create_handler(
+                {"user_id": "u999", "order_id": "ORD20250701001", "reason": "买错了"},
+                context=None,
+            )
+
+        self.assertEqual(ctx.exception.response.status_code, 404)
+
+    async def test_refund_create_posts_to_mock_external_refund_service(self):
+        from mcp.refund_create import RefundCreateService
+
+        client = TestClient(api_main.app)
+        transport = httpx.ASGITransport(app=api_main.app)
+        service = RefundCreateService(base_url=str(client.base_url), transport=transport)
+
+        result = await service.create_handler(
+            {"user_id": "u123", "order_id": "ORD20250701001", "reason": "买错了"},
+            context=None,
+        )
+
+        self.assertEqual(result["order_id"], "ORD20250701001")
+        self.assertEqual(result["status"], "submitted")
+        self.assertTrue(result["refund_id"].startswith("RF"))
+
     async def test_human_handoff_posts_context_to_mock_external_system(self):
         from mcp.handoff_service import HumanHandoffService
 

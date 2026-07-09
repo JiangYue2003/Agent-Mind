@@ -19,6 +19,64 @@ ToolResult = tool_manager_module.ToolResult
 
 
 class ToolManagerDedupTests(unittest.TestCase):
+    def test_rewrite_query_prompt_prefers_conservative_entity_preserving_rewrites(self):
+        manager = MCPToolManager.__new__(MCPToolManager)
+
+        captured = {}
+
+        class FakeContent:
+            text = '["退款多久到账"]'
+
+        class FakeResponse:
+            content = [FakeContent()]
+
+        class FakeMessages:
+            async def create(self, **kwargs):
+                captured.update(kwargs)
+                return FakeResponse()
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = FakeMessages()
+
+        manager._client = FakeClient()
+        manager._model = "deepseek-chat"
+
+        queries = asyncio.run(manager.rewrite_query("退款多久到账", n=3))
+
+        prompt = captured["messages"][0]["content"]
+        self.assertIn("不要引入原问题中没有的新条件", prompt)
+        self.assertIn("保留订单号、金额、日期、制度名、版本号等关键实体", prompt)
+        self.assertIn("如果原问题已经清晰，不要为了凑数而过度改写", prompt)
+        self.assertEqual(queries, ["退款多久到账"])
+
+    def test_rewrite_query_keeps_original_query_and_dedups(self):
+        manager = MCPToolManager.__new__(MCPToolManager)
+
+        class FakeContent:
+            text = '["退款多久到账", "退款多久到账", "退款审核通过后多久到账"]'
+
+        class FakeResponse:
+            content = [FakeContent()]
+
+        class FakeMessages:
+            async def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeClient:
+            def __init__(self):
+                self.messages = FakeMessages()
+
+        manager._client = FakeClient()
+        manager._model = "deepseek-chat"
+
+        queries = asyncio.run(manager.rewrite_query("退款多久到账", n=3))
+
+        self.assertEqual(
+            queries,
+            ["退款多久到账", "退款审核通过后多久到账"],
+        )
+
     def test_search_with_rewrite_dedups_by_parent_id_across_subqueries(self):
         manager = MCPToolManager.__new__(MCPToolManager)
         seen_params = []

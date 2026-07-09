@@ -94,6 +94,27 @@ class _FakeToolManager:
                 "updated_at": "2026-07-02T10:20:00+08:00",
                 "source": "mock_oms",
             })
+        if name == "shipment_track":
+            return _FakeToolCallResult(True, {
+                "order_id": params["order_id"],
+                "carrier": "顺丰速运",
+                "tracking_no": "SF1234567890",
+                "shipment_status": "运输中",
+                "events": [
+                    {"time": "2026-07-02 12:00:00", "status": "已发出"},
+                    {"time": "2026-07-03 09:30:00", "status": "运输中"},
+                ],
+                "source": "mock_tms",
+            })
+        if name == "refund_create":
+            return _FakeToolCallResult(True, {
+                "refund_id": "RF202607020001",
+                "order_id": params["order_id"],
+                "status": "submitted",
+                "amount": "99.00",
+                "reason": params.get("reason", ""),
+                "source": "mock_refund",
+            })
         if name == "human_handoff":
             return _FakeToolCallResult(True, {
                 "handoff_id": "HD202607020001",
@@ -197,6 +218,51 @@ class ChatToolAugmentationTests(unittest.TestCase):
         self.assertIn("订单号: ORD20250701001", orch_req.context)
         self.assertNotIn("[human_handoff]", orch_req.context)
 
+    def test_chat_clarifies_when_refund_request_is_missing_order_id(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.BILLING,
+            confidence=0.94,
+            urgency=UrgencyLevel.MEDIUM,
+            entities={"order_id": [], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户想申请退款，但没有提供订单号",
+            latency_ms=2.5,
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="我要退款",
+            user_id="u123",
+            conv_id="conv-clarify-1",
+        )))
+
+        self.assertIn("订单号", response.response)
+        self.assertEqual(self.fake_tool_manager.search_calls, [])
+        self.assertEqual(self.fake_tool_manager.call_calls, [])
+        self.assertEqual(self.fake_orchestrator.requests, [])
+
+    def test_chat_prefers_order_lookup_for_refund_status_with_order_id(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.BILLING,
+            confidence=0.97,
+            urgency=UrgencyLevel.MEDIUM,
+            entities={"order_id": ["ORD20250701002"], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户在查询自己订单的退款进度",
+            latency_ms=2.8,
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="帮我查一下订单 ORD20250701002 现在退款到哪了",
+            user_id="u456",
+            conv_id="conv-refund-lookup-1",
+        )))
+
+        self.assertEqual(len(self.fake_tool_manager.call_calls), 1)
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "order_lookup")
+        self.assertEqual(self.fake_tool_manager.search_calls, [])
+
+        orch_req = self.fake_orchestrator.requests[0]
+        self.assertIn("[order_lookup]", orch_req.context)
+        self.assertNotIn("[知识库检索结果]", orch_req.context)
+
     def test_chat_injects_handoff_context_for_explicit_escalation(self):
         api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
             intent=IntentCategory.ESCALATION,
@@ -215,6 +281,7 @@ class ChatToolAugmentationTests(unittest.TestCase):
 
         self.assertEqual(len(self.fake_tool_manager.call_calls), 1)
         self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "human_handoff")
+        self.assertEqual(self.fake_tool_manager.search_calls, [])
 
         orch_req = self.fake_orchestrator.requests[0]
         self.assertEqual(orch_req.intent, IntentCategory.ESCALATION)
@@ -245,6 +312,75 @@ class ChatToolAugmentationTests(unittest.TestCase):
         orch_req = self.fake_orchestrator.requests[0]
         self.assertIn("[知识库检索结果]", orch_req.context)
         self.assertNotIn("[工具增强上下文]", orch_req.context)
+
+    def test_chat_combines_knowledge_and_order_lookup_for_mixed_billing_question(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.BILLING,
+            confidence=0.96,
+            urgency=UrgencyLevel.MEDIUM,
+            entities={"order_id": ["ORD20250701003"], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户既在问退款规则，也在查询具体订单退款进度",
+            latency_ms=2.6,
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="请告诉我退款规则，并帮我看订单 ORD20250701003 现在退款到哪了",
+            user_id="u123",
+            conv_id="conv-4",
+        )))
+
+        self.assertEqual(self.fake_tool_manager.search_calls[0]["tool_name"], "knowledge_search")
+        self.assertEqual(len(self.fake_tool_manager.call_calls), 1)
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "order_lookup")
+
+        orch_req = self.fake_orchestrator.requests[0]
+        self.assertIn("[知识库检索结果]", orch_req.context)
+        self.assertIn("[工具增强上下文]", orch_req.context)
+        self.assertIn("[order_lookup]", orch_req.context)
+
+    def test_chat_uses_shipment_track_for_logistics_query(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.QUERY,
+            confidence=0.95,
+            urgency=UrgencyLevel.MEDIUM,
+            entities={"order_id": ["ORD20250701001"], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户在查询物流进度",
+            latency_ms=2.1,
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="帮我查一下订单 ORD20250701001 的物流到哪了",
+            user_id="u123",
+            conv_id="conv-shipment-1",
+        )))
+
+        self.assertEqual(len(self.fake_tool_manager.call_calls), 1)
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "shipment_track")
+        orch_req = self.fake_orchestrator.requests[0]
+        self.assertIn("[shipment_track]", orch_req.context)
+        self.assertIn("顺丰速运", orch_req.context)
+
+    def test_chat_uses_refund_create_for_explicit_refund_request_with_order_id(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.BILLING,
+            confidence=0.97,
+            urgency=UrgencyLevel.MEDIUM,
+            entities={"order_id": ["ORD20250701001"], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户希望直接申请退款",
+            latency_ms=2.0,
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="请直接帮我给订单 ORD20250701001 申请退款，原因是买错了",
+            user_id="u123",
+            conv_id="conv-refund-create-1",
+        )))
+
+        self.assertEqual(len(self.fake_tool_manager.call_calls), 1)
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "refund_create")
+        orch_req = self.fake_orchestrator.requests[0]
+        self.assertIn("[refund_create]", orch_req.context)
+        self.assertIn("申请状态: submitted", orch_req.context)
 
 
 if __name__ == "__main__":
