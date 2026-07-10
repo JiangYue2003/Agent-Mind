@@ -1,0 +1,5 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+FlagEmbedding>=1.3,<2
+# FlagReranker still calls prepare_for_model, which Transformers 5 removed.
+transformers==4.57.3

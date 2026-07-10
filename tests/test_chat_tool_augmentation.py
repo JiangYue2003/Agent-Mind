@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from api import main as api_main
-from agents.agent_orchestrator import AgentType, OrchestratorResult
+from agents.agent_orchestrator import AgentResponse, AgentType, OrchestratorResult
 from core.intent_recognizer import IntentCategory, UrgencyLevel
 
 
@@ -128,6 +128,15 @@ class _FakeToolManager:
 class _FakeOrchestrator:
     def __init__(self):
         self.requests = []
+
+    async def _execute(self, req, agent_type, context=None):
+        self.requests.append(req)
+        return AgentResponse(
+            agent_type=agent_type,
+            content="好的，已为您处理。",
+            success=True,
+            escalate=req.intent == IntentCategory.ESCALATION,
+        )
 
     async def run(self, req, context=None):
         self.requests.append(req)

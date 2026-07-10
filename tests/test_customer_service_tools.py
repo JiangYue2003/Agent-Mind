@@ -31,12 +31,12 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         service = OrderLookupService(base_url=str(client.base_url), transport=transport)
 
         result = await service.lookup_handler(
-            {"user_id": "u123", "order_id": "ORD20250701001"},
+            {"user_id": "u1001", "order_id": "ORD20250701001"},
             context=None,
         )
 
         self.assertEqual(result["order_id"], "ORD20250701001")
-        self.assertEqual(result["user_id"], "u123")
+        self.assertEqual(result["user_id"], "u1001")
         self.assertEqual(result["status"], "运输中")
         self.assertEqual(result["source"], "mock_oms")
 
@@ -63,7 +63,7 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         service = ShipmentTrackService(base_url=str(client.base_url), transport=transport)
 
         result = await service.track_handler(
-            {"user_id": "u123", "order_id": "ORD20250701001"},
+            {"user_id": "u1001", "order_id": "ORD20250701001"},
             context=None,
         )
 
@@ -94,7 +94,7 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         service = RefundCreateService(base_url=str(client.base_url), transport=transport)
 
         result = await service.create_handler(
-            {"user_id": "u123", "order_id": "ORD20250701001", "reason": "买错了"},
+            {"user_id": "u1001", "order_id": "ORD20250701001", "reason": "买错了"},
             context=None,
         )
 

@@ -139,6 +139,7 @@ class Tool:
     cache_ttl:   float = 0.0                 # 0 = 不缓存
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
+    rerank_handler: Optional[Callable] = None  # async (query, candidates, top_k, context) -> list
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
 
     # 运行时状态（不参与构造）
@@ -155,6 +156,8 @@ class MCPToolManager:
     核心优化链路（针对检索类工具）：
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
     """
+
+    DEFAULT_RERANK_RECALL_K = 12
 
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
         kwargs: Dict[str, Any] = {"api_key": api_key}
@@ -341,6 +344,8 @@ class MCPToolManager:
         这是解决"检索不全、召回不好"的完整方案。
         """
         trace = (context or {}).get("trace")
+        tool = getattr(self, "_tools", {}).get(tool_name)
+        use_tool_reranker = bool(tool and tool.rerank_handler)
         # 1. 查询改写：生成多角度子查询
         if trace is None:
             sub_queries = await self.rewrite_query(query, n=3)
@@ -351,11 +356,19 @@ class MCPToolManager:
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         # 2. 并行召回：所有子查询同时检索
-        effective_recall_k = max(top_k, int(recall_k)) if recall_k is not None else max(top_k, 5)
+        effective_recall_k = max(
+            top_k + 1,
+            int(recall_k) if recall_k is not None else self.DEFAULT_RERANK_RECALL_K,
+        )
         tasks = [
             self.call(
                 tool_name,
-                {"query": q, "top_k": effective_recall_k, "recall_k": effective_recall_k},
+                {
+                    "query": q,
+                    "top_k": effective_recall_k if use_tool_reranker else top_k,
+                    "recall_k": effective_recall_k,
+                    "skip_rerank": use_tool_reranker,
+                },
                 context,
                 use_cache=True,
             )
@@ -391,8 +404,30 @@ class MCPToolManager:
         if not merged:
             return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
 
+        if use_tool_reranker:
+            merged.sort(key=lambda item: item.get("score", 0.0) if isinstance(item, dict) else 0.0, reverse=True)
+
+            async def run_tool_rerank() -> List[Any]:
+                reranked = tool.rerank_handler(query, merged, top_k, context)
+                if asyncio.iscoroutine(reranked):
+                    reranked = await reranked
+                return reranked
+
+            if trace is None:
+                reranked = await run_tool_rerank()
+            else:
+                with trace.stage("tool_manager.global_rerank"):
+                    with trace.stage("knowledge.global_rerank"):
+                        reranked = await run_tool_rerank()
+            return ToolResult(
+                success=True,
+                data=reranked,
+                tool_name=tool_name,
+                reranked=bool(reranked) and all(self._has_real_rerank(item) for item in reranked),
+            )
+
         # 4. 检索工具若已完成内部精排，则直接截断返回；否则使用外层 LLM 重排
-        if all(self._looks_reranked(item) for item in merged):
+        if all(self._has_real_rerank(item) for item in merged):
             merged.sort(key=lambda item: item.get("score", item.get("rerank_score", 0.0)), reverse=True)
             return ToolResult(success=True, data=merged[:top_k], tool_name=tool_name, reranked=True)
 
@@ -401,7 +436,12 @@ class MCPToolManager:
         else:
             with trace.stage("tool_manager.outer_rerank"):
                 reranked = await self._rerank(query, merged, top_k, trace=trace)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        return ToolResult(
+            success=True,
+            data=reranked,
+            tool_name=tool_name,
+            reranked=bool(reranked) and all(self._has_real_rerank(item) for item in reranked),
+        )
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
@@ -446,7 +486,10 @@ class MCPToolManager:
             s, e = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[s:e])
             reranked = [items[i] for i in order if 0 <= i < len(items)]
-            return reranked[:top_k]
+            return [
+                self._mark_llm_reranked(item)
+                for item in reranked[:top_k]
+            ]
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
             return items[:top_k]
@@ -470,8 +513,17 @@ class MCPToolManager:
         return f"fallback:{hashlib.md5(str(item).encode()).hexdigest()}"
 
     @staticmethod
-    def _looks_reranked(item: Any) -> bool:
-        return isinstance(item, dict) and "rerank_score" in item
+    def _has_real_rerank(item: Any) -> bool:
+        return isinstance(item, dict) and item.get("rerank_applied") is True
+
+    @staticmethod
+    def _mark_llm_reranked(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        updated = dict(item)
+        updated["rerank_applied"] = True
+        updated["rerank_provider"] = "llm"
+        return updated
 
     # ── 缓存 ──────────────────────────────────────────────────────────────────
 

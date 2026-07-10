@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 import chromadb
 import redis
 from anthropic import AsyncAnthropic
+from core.dashscope_embedding import DashScopeEmbeddingClient, EmbeddingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,8 @@ class MemoryManager:
     WORKING_MAX   = 20    # 工作记忆最大条数，超过则触发压缩
     COMPRESS_AT   = 15    # 达到此条数时压缩，保留摘要 + 最近 5 条
     HISTORY_TOP_K = 5     # 情景记忆检索返回条数
+    EPISODIC_COLLECTION_NAME = "episodic_v4"
+    PROFILE_COLLECTION_NAME = "user_profile_v4"
 
     def __init__(
         self,
@@ -98,6 +101,11 @@ class MemoryManager:
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
+        try:
+            self._embedding_client = DashScopeEmbeddingClient.from_env()
+        except EmbeddingUnavailable as ex:
+            self._embedding_client = None
+            logger.warning(f"DashScope text-embedding-v4 unavailable; semantic memory disabled: {ex}")
 
         # ChromaDB：优先连接独立服务（docker compose 模式），连不上则降级为本地嵌入式
         try:
@@ -111,10 +119,15 @@ class MemoryManager:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
-        # 用户画像：存储提炼出的偏好和实体
-        self._profile  = chroma.get_or_create_collection("user_profile")
+        # 新集合只接受调用方显式提供的 v4 向量，旧集合保持物理保留但不会再被打开。
+        self._episodic = chroma.get_or_create_collection(
+            self.EPISODIC_COLLECTION_NAME,
+            embedding_function=None,
+        )
+        self._profile = chroma.get_or_create_collection(
+            self.PROFILE_COLLECTION_NAME,
+            embedding_function=None,
+        )
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -152,7 +165,7 @@ class MemoryManager:
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """
         从当前工作记忆中提炼用户偏好，更新用户画像。
-        用 LLM 提炼偏好，然后存入 ChromaDB（ChromaDB 内置 embedding，不依赖外部 API）。
+        用 LLM 提炼偏好，再使用 DashScope v4 向量存入 ChromaDB。
         """
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
@@ -185,12 +198,13 @@ class MemoryManager:
             except Exception:
                 pass
 
-            # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
+            embeddings = self._require_embedding_client().embed_documents([doc_text])
             self._profile.add(
                 ids=[doc_id],
                 documents=[doc_text],
                 metadatas=[{"user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat()}],
+                embeddings=embeddings,
             )
             logger.info(f"用户画像已更新: {user_id}")
         except Exception as ex:
@@ -293,14 +307,15 @@ class MemoryManager:
         return msgs
 
     async def _search_episodic(self, user_id: str, query: str) -> List[str]:
-        """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """用 DashScope v4 查询向量检索情景记忆。"""
         query_text = self._safe_text(query).strip()
-        if not query_text:
+        embedding_client = getattr(self, "_embedding_client", None)
+        if not query_text or embedding_client is None:
             return []
         try:
-            # 直接传 query_texts，ChromaDB 内置模型自动生成向量做匹配
+            query_embedding = embedding_client.embed_query(query_text)
             results = self._episodic.query(
-                query_texts=[query_text],
+                query_embeddings=[query_embedding],
                 n_results=self.HISTORY_TOP_K,
                 where={"user_id": self._safe_text(user_id)},
             )
@@ -311,19 +326,20 @@ class MemoryManager:
             return []
 
     async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str) -> None:
-        """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """将压缩后的对话片段连同 DashScope v4 文档向量存入情景记忆。"""
         try:
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
             text = self._safe_text(text)
             summary = self._safe_text(summary)
             doc_id = hashlib.md5(f"{user_id}{conv_id}{time.time()}".encode()).hexdigest()
-            # 直接传 documents，ChromaDB 内置模型自动生成 embedding
+            embeddings = self._require_embedding_client().embed_documents([summary])
             self._episodic.add(
                 ids=[doc_id],
                 documents=[summary],
                 metadatas=[{"user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500])}],
+                embeddings=embeddings,
             )
         except Exception as ex:
             logger.warning(f"存储情景记忆失败: {ex}")
@@ -337,6 +353,12 @@ class MemoryManager:
         except Exception:
             pass
         return {}
+
+    def _require_embedding_client(self) -> DashScopeEmbeddingClient:
+        embedding_client = getattr(self, "_embedding_client", None)
+        if embedding_client is None:
+            raise EmbeddingUnavailable("DashScope text-embedding-v4 is required for semantic memory")
+        return embedding_client
 
     @staticmethod
     def _wm_key(user_id: str, conv_id: str) -> str:

@@ -10,21 +10,15 @@
 LLM 和 Embedding 并行调用，不串行等待。
 """
 import asyncio
-import hashlib
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
-
-try:
-    from dashscope import TextEmbedding
-except ImportError:  # pragma: no cover - 运行环境未安装 dashscope 时保留本地兜底
-    TextEmbedding = None
+from core.dashscope_embedding import DashScopeEmbeddingClient, EmbeddingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +111,7 @@ class IntentRecognizer:
     """
     端到端意图识别器。
 
-    初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
-    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    模板 Embedding 在首次请求时通过 DashScope v4 懒加载并缓存，后续复用。
     """
 
     def __init__(
@@ -134,14 +127,12 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        self._embedding_provider = os.getenv("INTENT_EMBEDDING_PROVIDER", "").strip().lower()
-        self._dashscope_api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-        self._embedding_model = os.getenv("INTENT_EMBEDDING_MODEL", "text-embedding-v3").strip() or "text-embedding-v3"
-        # 默认仍兼容原有行为：官方 Anthropic 路径允许尝试远端 embedding。
-        # 如果显式配置了 DashScope embedding，则即使 LLM 走第三方兼容 base_url 也启用该分支。
-        self._embedding_enabled = self._embedding_provider == "dashscope" and bool(self._dashscope_api_key)
-        if not self._embedding_enabled:
-            self._embedding_enabled = not bool(base_url)
+        try:
+            self._embedding_client = DashScopeEmbeddingClient.from_env()
+        except EmbeddingUnavailable as ex:
+            self._embedding_client = None
+            logger.warning(f"DashScope text-embedding-v4 unavailable; intent embedding disabled: {ex}")
+        self._embedding_enabled = self._embedding_client is not None
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}
@@ -291,7 +282,7 @@ class IntentRecognizer:
             return {"intent": best_cat, "confidence": best_score}
         except Exception as ex:
             logger.warning(f"Embedding 识别失败: {ex}")
-            return {"intent": IntentCategory.OTHER, "confidence": 0.0}
+            return {"intent": IntentCategory.OTHER, "confidence": 0.0, "unavailable": True}
 
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
         """策略 3：关键词模式匹配（同步，零延迟兜底）。"""
@@ -326,7 +317,7 @@ class IntentRecognizer:
                 return pat["intent"]
             return IntentCategory.OTHER
 
-        if self._embedding_enabled:
+        if self._embedding_enabled and not emb.get("unavailable"):
             weights = [(llm, 0.7), (emb, 0.2), (pat, 0.1)]
         else:
             weights = [(llm, 0.85), (pat, 0.15)]
@@ -377,8 +368,9 @@ class IntentRecognizer:
         if not missing:
             return
 
+        embedding_client = self._require_embedding_client()
         all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
+        vecs = await asyncio.to_thread(embedding_client.embed_documents, all_texts)
         idx = 0
         for cat in missing:
             n = len(_TEMPLATES[cat])
@@ -386,63 +378,15 @@ class IntentRecognizer:
             idx += n
 
     async def _embed_text(self, text: str) -> List[float]:
-        """
-        生成文本向量。
+        """使用共享 DashScope v4 客户端生成用户消息的查询向量。"""
+        embedding_client = self._require_embedding_client()
+        return await asyncio.to_thread(embedding_client.embed_query, self._clean_text(text))
 
-        如果未来接入的官方/兼容客户端提供 embeddings.create，会优先使用远端向量；
-        当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
-        Embedding 服务缺失导致三路融合中断。
-        """
-        if self._embedding_provider == "dashscope" and self._dashscope_api_key and TextEmbedding is not None:
-            try:
-                return await asyncio.to_thread(self._dashscope_embed_text, text)
-            except Exception as ex:
-                logger.warning(f"DashScope Embedding 失败，使用本地向量兜底: {ex}")
-
-        embeddings = getattr(self.client, "embeddings", None)
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
-
-        return self._local_embedding(text)
-
-    def _dashscope_embed_text(self, text: str) -> List[float]:
-        if TextEmbedding is None:
-            raise RuntimeError("dashscope sdk not installed")
-        response = TextEmbedding.call(
-            api_key=self._dashscope_api_key,
-            model=self._embedding_model,
-            input=text,
-            text_type="query",
-        )
-        if getattr(response, "status_code", None) != 200:
-            raise RuntimeError(getattr(response, "message", "unknown dashscope embedding error"))
-        embeddings = response.output.get("embeddings", []) if getattr(response, "output", None) else []
-        if not embeddings:
-            raise RuntimeError("dashscope embedding response missing embeddings")
-        return list(embeddings[0]["embedding"])
-
-    @staticmethod
-    def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """稳定的字符 n-gram 哈希向量，用于无远端 Embedding 时的语义近似匹配。"""
-        normalized = text.lower().strip()
-        vec = [0.0] * dims
-        tokens = set()
-        for n in (1, 2, 3):
-            if len(normalized) >= n:
-                tokens.update(normalized[i:i + n] for i in range(len(normalized) - n + 1))
-        if not tokens:
-            tokens.add(normalized)
-
-        for token in tokens:
-            digest = hashlib.md5(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:4], "big") % dims
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vec[idx] += sign
-        return vec
+    def _require_embedding_client(self) -> DashScopeEmbeddingClient:
+        embedding_client = getattr(self, "_embedding_client", None)
+        if embedding_client is None:
+            raise EmbeddingUnavailable("DashScope text-embedding-v4 is unavailable")
+        return embedding_client
 
     def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
         msg = message.lower()

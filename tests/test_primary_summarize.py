@@ -79,6 +79,35 @@ class PrimarySummarizeTests(unittest.TestCase):
         self.assertEqual(result.agent_type, AgentType.BILLING)
         self.assertEqual(result.response, "已结合账单和技术信息整理最终答复。")
 
+    def test_single_agent_route_plan_uses_primary_agent_instead_of_fallback_run(self):
+        fake = _FakePrimarySummarizeOrchestrator()
+        api_main._orchestrator = fake
+        req = Request(
+            message="我想查询一下退款政策",
+            user_id="u123",
+            conv_id="conv-ps-2",
+            context="[知识库检索结果]\n退款规则说明",
+        )
+        plan = WorkflowPlan(
+            complexity="single_domain",
+            primary_intent="query",
+            route_plan=RoutePlan(
+                primary_agent=AgentRole.BILLING,
+                supporting_agents=[],
+                merge_mode=MergeMode.SINGLE_AGENT,
+                final_writer=AgentRole.BILLING,
+                reason="退款政策问题由账单 Agent 主答",
+            ),
+        )
+
+        result = asyncio.run(api_main._run_planned_orchestrator(req, plan, trace=None))
+
+        self.assertEqual(len(fake.run_calls), 0)
+        self.assertEqual(len(fake.execute_calls), 1)
+        self.assertEqual(fake.execute_calls[0]["agent_type"], AgentType.BILLING)
+        self.assertEqual(result.agent_type, AgentType.BILLING)
+        self.assertEqual(result.response, "已结合账单和技术信息整理最终答复。")
+
 
 if __name__ == "__main__":
     unittest.main()

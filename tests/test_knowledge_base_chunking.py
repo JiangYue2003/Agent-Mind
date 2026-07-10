@@ -1,9 +1,11 @@
+import asyncio
 import importlib.util
 import os
 import pathlib
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 
@@ -27,10 +29,19 @@ knowledge_base_module = _load_knowledge_base_module()
 KnowledgeBase = knowledge_base_module.KnowledgeBase
 
 
+class _FakeEmbeddingClient:
+    def embed_documents(self, texts):
+        return [[0.1] * 4 for _ in texts]
+
+    def embed_query(self, text):
+        return [0.1] * 4
+
+
 class KnowledgeBaseChunkingTests(unittest.TestCase):
     def setUp(self):
         self.kb = KnowledgeBase.__new__(KnowledgeBase)
         self.kb._rerank_score_threshold = KnowledgeBase.DEFAULT_RERANK_SCORE_THRESHOLD
+        self.kb._embedding_client = _FakeEmbeddingClient()
 
     def test_prefers_paragraph_boundaries_before_sentence_split(self):
         text = (
@@ -170,7 +181,7 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
 
     def test_search_returns_structural_metadata(self):
         class FakeCollection:
-            def query(self, query_texts, n_results):
+            def query(self, query_embeddings, n_results):
                 return {
                     "documents": [["审核通过后 1-3 个工作日内处理。"]],
                     "metadatas": [[{
@@ -194,7 +205,7 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
 
     def test_search_uses_hybrid_recall_and_returns_reranked_child_candidate(self):
         class FakeChildCollection:
-            def query(self, query_texts, n_results):
+            def query(self, query_embeddings, n_results):
                 return {
                     "documents": [[
                         "标准配送通常 3-5 个工作日送达。",
@@ -341,6 +352,214 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertAlmostEqual(items[0]["rerank_score"], 0.91)
 
+    def test_rerank_candidates_maps_tei_scores_to_original_candidates(self):
+        self.kb._rerank_provider = "tei"
+        self.kb._rerank_url = "http://reranker:80/rerank"
+        self.kb._rerank_timeout_seconds = 3.0
+        self.kb._rerank_score_threshold = 0.0
+        candidates = [
+            {"content": "候选 A", "score": 0.03, "rrf_score": 0.03},
+            {"content": "候选 B", "score": 0.02, "rrf_score": 0.02},
+            {"content": "候选 C", "score": 0.01, "rrf_score": 0.01},
+        ]
+        seen = {}
+        rerank_meta = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [
+                    {"index": 2, "score": 0.93},
+                    {"index": 1, "score": 0.82},
+                    {"index": 0, "score": 0.07},
+                ]
+
+        def fake_post(url, **kwargs):
+            seen["url"] = url
+            seen.update(kwargs)
+            return FakeResponse()
+
+        original_post = knowledge_base_module.httpx.post
+        knowledge_base_module.httpx.post = fake_post
+        try:
+            items = self.kb._rerank_candidates("退款规则", candidates, top_n=2, rerank_meta=rerank_meta)
+        finally:
+            knowledge_base_module.httpx.post = original_post
+
+        self.assertEqual([item["content"] for item in items], ["候选 C", "候选 B"])
+        self.assertAlmostEqual(items[0]["rerank_score"], 0.93)
+        self.assertEqual(seen["url"], "http://reranker:80/rerank")
+        self.assertEqual(seen["json"], {
+            "query": "退款规则",
+            "texts": ["候选 A", "候选 B", "候选 C"],
+            "return_text": False,
+            "truncate": True,
+        })
+        self.assertEqual(seen["timeout"], 3.0)
+        self.assertEqual(rerank_meta, {
+            "provider": "tei",
+            "candidate_count": 3,
+            "returned_candidate_count": 2,
+            "fallback_used": False,
+            "rerank_applied": True,
+        })
+
+    def test_rerank_candidates_calls_tei_even_when_candidates_do_not_fill_top_k(self):
+        self.kb._rerank_provider = "tei"
+        self.kb._rerank_url = "http://reranker:80/rerank"
+        self.kb._rerank_timeout_seconds = 3.0
+        self.kb._rerank_score_threshold = 0.0
+        candidates = [
+            {"content": "候选 A", "score": 0.03, "rrf_score": 0.03},
+            {"content": "候选 B", "score": 0.02, "rrf_score": 0.02},
+        ]
+        calls = []
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"index": 1, "score": 0.91}, {"index": 0, "score": 0.11}]
+
+        original_post = knowledge_base_module.httpx.post
+        knowledge_base_module.httpx.post = lambda *args, **kwargs: (calls.append((args, kwargs)) or FakeResponse())
+        try:
+            items = self.kb._rerank_candidates("退款规则", candidates, top_n=3)
+        finally:
+            knowledge_base_module.httpx.post = original_post
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["content"] for item in items], ["候选 B", "候选 A"])
+        self.assertTrue(all(item["rerank_applied"] for item in items))
+        self.assertTrue(all(item["rerank_provider"] == "tei" for item in items))
+
+    def test_search_handler_can_return_raw_fused_candidates_for_global_reranking(self):
+        candidates = [
+            {"content": "候选 A", "score": 0.03, "rrf_score": 0.03},
+            {"content": "候选 B", "score": 0.02, "rrf_score": 0.02},
+        ]
+        self.kb._vector_recall = lambda query, top_n, **_: candidates
+        self.kb._bm25_recall = lambda query, top_n: []
+        self.kb._fuse_recall_results = lambda vector_hits, bm25_hits, top_n: vector_hits
+        self.kb._attach_parent_context = lambda items: items
+        self.kb._rerank_candidates = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("inner rerank should be skipped")
+        )
+
+        items = asyncio.run(self.kb.search_handler({
+            "query": "退款规则",
+            "top_k": 12,
+            "recall_k": 12,
+            "skip_rerank": True,
+        }, None))
+
+        self.assertEqual(items, candidates)
+
+    def test_rerank_handler_caps_the_global_candidate_window_before_tei(self):
+        self.kb._rerank_candidate_k = 4
+        seen = {}
+
+        def fake_rerank_candidates(query, candidates, top_n):
+            seen["query"] = query
+            seen["candidates"] = candidates
+            seen["top_n"] = top_n
+            return candidates[:top_n]
+
+        self.kb._rerank_candidates = fake_rerank_candidates
+        candidates = [{"content": f"候选 {index}"} for index in range(6)]
+
+        items = asyncio.run(self.kb.rerank_handler("退款规则", candidates, top_k=3))
+
+        self.assertEqual(seen["query"], "退款规则")
+        self.assertEqual(len(seen["candidates"]), 4)
+        self.assertEqual(seen["top_n"], 3)
+        self.assertEqual(items, candidates[:3])
+
+    def test_rerank_candidates_falls_back_to_rrf_when_tei_is_unavailable(self):
+        self.kb._rerank_provider = "tei"
+        self.kb._rerank_url = "http://reranker:80/rerank"
+        self.kb._rerank_timeout_seconds = 3.0
+        candidates = [
+            {"content": "候选 A", "score": 0.03, "rrf_score": 0.03},
+            {"content": "候选 B", "score": 0.02, "rrf_score": 0.02},
+            {"content": "候选 C", "score": 0.01, "rrf_score": 0.01},
+        ]
+        rerank_meta = {}
+
+        original_post = knowledge_base_module.httpx.post
+        knowledge_base_module.httpx.post = lambda *args, **kwargs: (_ for _ in ()).throw(
+            knowledge_base_module.httpx.ConnectError("reranker unavailable")
+        )
+        try:
+            items = self.kb._rerank_candidates("退款规则", candidates, top_n=2, rerank_meta=rerank_meta)
+        finally:
+            knowledge_base_module.httpx.post = original_post
+
+        self.assertEqual([item["content"] for item in items], ["候选 A", "候选 B"])
+        self.assertAlmostEqual(items[0]["rerank_score"], 0.03)
+        self.assertFalse(items[0]["rerank_applied"])
+        self.assertEqual(items[0]["rerank_provider"], "rrf_fallback")
+        self.assertEqual(rerank_meta, {
+            "provider": "tei",
+            "candidate_count": 3,
+            "returned_candidate_count": 2,
+            "fallback_used": True,
+            "rerank_applied": False,
+        })
+
+    def test_search_with_trace_records_local_rerank_metadata(self):
+        self.kb._rerank_provider = "tei"
+        self.kb._rerank_url = "http://reranker:80/rerank"
+        self.kb._rerank_timeout_seconds = 3.0
+        self.kb._rerank_score_threshold = 0.0
+        candidates = [
+            {"content": "候选 A", "score": 0.03, "rrf_score": 0.03},
+            {"content": "候选 B", "score": 0.02, "rrf_score": 0.02},
+        ]
+
+        class FakeTrace:
+            def __init__(self):
+                self.stages = []
+
+            @contextmanager
+            def stage(self, name, **meta):
+                stage = types.SimpleNamespace(name=name, meta=meta)
+                self.stages.append(stage)
+                yield stage
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"index": 1, "score": 0.91}, {"index": 0, "score": 0.11}]
+
+        self.kb._vector_recall = lambda query, top_n, **_: candidates
+        self.kb._bm25_recall = lambda query, top_n: []
+        self.kb._fuse_recall_results = lambda vector_hits, bm25_hits, top_n: vector_hits
+        self.kb._attach_parent_context = lambda items: items
+        trace = FakeTrace()
+
+        original_post = knowledge_base_module.httpx.post
+        knowledge_base_module.httpx.post = lambda *args, **kwargs: FakeResponse()
+        try:
+            items = self.kb.search_with_trace("退款规则", top_k=1, recall_k=2, trace=trace)
+        finally:
+            knowledge_base_module.httpx.post = original_post
+
+        rerank_stage = next(stage for stage in trace.stages if stage.name == "knowledge.rerank")
+        self.assertEqual(items[0]["content"], "候选 B")
+        self.assertEqual(rerank_stage.meta, {
+            "provider": "tei",
+            "candidate_count": 2,
+            "returned_candidate_count": 1,
+            "fallback_used": False,
+            "rerank_applied": True,
+        })
+
     def test_rerank_threshold_does_not_filter_rrf_fallback_results(self):
         self.kb._rerank_api_key = ""
 
@@ -357,11 +576,12 @@ class KnowledgeBaseChunkingTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def add(self, ids, documents, metadatas):
+            def add(self, ids, documents, metadatas, embeddings=None):
                 self.calls.append({
                     "ids": ids,
                     "documents": documents,
                     "metadatas": metadatas,
+                    "embeddings": embeddings,
                 })
 
             def count(self):

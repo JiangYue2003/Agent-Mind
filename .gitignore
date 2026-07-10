@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-reranker/
 venv/
 
 # 环境变量（含敏感信息）
@@ -43,3 +44,4 @@ docker-compose(1).yml
 /日常开发流程.md
 /Typora_Hook_Log.txt
 /docker-compose.dev.yml
+/docs/superpowers/specs/Typora_Hook_Log.txt

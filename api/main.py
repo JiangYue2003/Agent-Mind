@@ -62,7 +62,7 @@ _mock_refund_records: Dict[str, Dict[str, Any]] = {}
 _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
     "ORD20250701001": {
         "order_id": "ORD20250701001",
-        "user_id": "u123",
+        "user_id": "u1001",
         "status": "运输中",
         "amount": "99.00",
         "payment_status": "已支付",
@@ -84,7 +84,7 @@ _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
     },
     "ORD20250701003": {
         "order_id": "ORD20250701003",
-        "user_id": "u123",
+        "user_id": "u1001",
         "status": "已支付",
         "amount": "59.90",
         "payment_status": "已支付",
@@ -98,7 +98,7 @@ _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
 _MOCK_SHIPMENT_DATA: Dict[str, Dict[str, Any]] = {
     "ORD20250701001": {
         "order_id": "ORD20250701001",
-        "user_id": "u123",
+        "user_id": "u1001",
         "carrier": "顺丰速运",
         "tracking_no": "SF1234567890",
         "shipment_status": "运输中",
@@ -241,6 +241,7 @@ async def lifespan(app: FastAPI):
         },
         cache_ttl=300.0,
         supports_rerank=True,
+        rerank_handler=kb.rerank_handler,
         fallback=knowledge_fallback,
     ))
     _tool_manager.register(Tool(
@@ -730,8 +731,31 @@ async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None)
     from agents.agent_orchestrator import OrchestratorResult, Request as OrcReq
 
     route_plan = getattr(plan, "route_plan", None)
-    if _orchestrator is None or route_plan is None or not getattr(route_plan, "supporting_agents", []):
+    if _orchestrator is None or route_plan is None:
         return await _orchestrator.run(orch_req, context={"trace": trace} if trace is not None else None)
+
+    if not getattr(route_plan, "supporting_agents", []):
+        primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
+        overall_t0 = time.monotonic()
+        if trace is None:
+            primary_response = await _orchestrator._execute(orch_req, primary_agent_type, context=None)
+        else:
+            with trace.stage("orchestrator.execute", agent_type=primary_agent_type.value):
+                primary_response = await _orchestrator._execute(
+                    orch_req,
+                    primary_agent_type,
+                    context={"trace": trace},
+                )
+
+        escalated = bool(getattr(primary_response, "escalate", False))
+        return OrchestratorResult(
+            request_id=orch_req.request_id,
+            response=primary_response.content,
+            agent_type=primary_response.agent_type,
+            intent=orch_req.intent,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - overall_t0) * 1000,
+        )
 
     overall_t0 = time.monotonic()
     supporting_agent_types = [_agent_type_from_role(agent) for agent in route_plan.supporting_agents]
@@ -1329,7 +1353,25 @@ async def search(query: str, top_k: int = 5, recall_k: Optional[int] = None):
         top_k=top_k,
         recall_k=recall_k,
     )
-    return {"query": query, "results": result.data, "reranked": result.reranked, "recall_k": recall_k}
+    results = result.data if isinstance(result.data, list) else []
+    rerank_providers = sorted({
+        str(item.get("rerank_provider"))
+        for item in results
+        if isinstance(item, dict) and item.get("rerank_provider")
+    })
+    rerank_applied = bool(results) and all(
+        isinstance(item, dict) and item.get("rerank_applied") is True
+        for item in results
+    )
+    return {
+        "query": query,
+        "results": results,
+        "reranked": result.reranked,
+        "rerank_applied": rerank_applied,
+        "rerank_providers": rerank_providers,
+        "top_k": top_k,
+        "recall_k": recall_k,
+    }
 
 
 class DocInput(BaseModel):

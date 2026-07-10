@@ -29,7 +29,7 @@ class InMemoryCollection:
     def __init__(self):
         self.records = {}
 
-    def add(self, ids, documents, metadatas):
+    def add(self, ids, documents, metadatas, embeddings=None):
         for item_id, document, metadata in zip(ids, documents, metadatas):
             self.records[str(item_id)] = {
                 "document": document,
@@ -74,6 +74,14 @@ class InMemoryCollection:
         return True
 
 
+class FakeEmbeddingClient:
+    def embed_documents(self, texts):
+        return [[0.1] * 4 for _ in texts]
+
+    def embed_query(self, text):
+        return [0.1] * 4
+
+
 class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
     def _make_kb(self):
         kb = KnowledgeBase.__new__(KnowledgeBase)
@@ -87,6 +95,7 @@ class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
         kb._rerank_api_key = ""
         kb._rerank_model = "qwen3-rerank"
         kb._rerank_instruct = KnowledgeBase.DEFAULT_RERANK_INSTRUCT
+        kb._embedding_client = FakeEmbeddingClient()
         kb._parent_collection = InMemoryCollection()
         kb._child_collection = InMemoryCollection()
         kb._collection = kb._child_collection

@@ -270,10 +270,10 @@ class AgentOrchestrator:
 
         # 3. 执行（含降级）
         if trace is None:
-            response = await self._execute(req, agent_type)
+            response = await self._execute(req, agent_type, context=context)
         else:
             with trace.stage("orchestrator.execute", agent_type=agent_type.value):
-                response = await self._execute(req, agent_type)
+                response = await self._execute(req, agent_type, context=context)
 
         # 4. 升级检查
         escalated = False

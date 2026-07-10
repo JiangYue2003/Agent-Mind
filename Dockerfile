@@ -32,6 +32,21 @@ RUN mkdir -p /root/.cache/chroma/onnx_models/all-MiniLM-L6-v2 && \
     tar -xzf onnx.tar.gz && \
     rm onnx.tar.gz
 
+FROM dependencies AS evaluation
+
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY evaluation/requirements-ragas.txt /tmp/requirements-ragas.txt
+RUN pip install -r /tmp/requirements-ragas.txt
+
+COPY . .
+
+RUN useradd -m -u 1000 echomind && \
+    mkdir -p /app/data/eval && \
+    chown -R echomind:echomind /app
+USER echomind
+
 # ── 阶段 3：生产镜像 ──────────────────────────────────────────────────────────
 FROM base AS production
 

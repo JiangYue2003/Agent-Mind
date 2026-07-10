@@ -1,0 +1,7 @@
+# Kept outside production requirements because evaluation runs in a separate image.
+ragas>=0.3,<0.4
+openai>=1,<3
+langchain>=0.3,<0.4
+langchain-core>=0.3,<0.4
+langchain-community>=0.3,<0.4
+langchain-openai>=0.3,<0.4

@@ -2,7 +2,7 @@
 RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 
 功能：
-  1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
+  1. 文档导入：将文本切片后写入 DashScope v4 向量与 ChromaDB
   2. 语义检索：根据 query 从知识库中检索最相关的文档片段
   3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
 
@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 import httpx
+from core.dashscope_embedding import DashScopeEmbeddingClient, EmbeddingUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +34,19 @@ class KnowledgeBase:
     """
     基于 ChromaDB 的 RAG 知识库。
 
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
-    调用 add() 时自动生成向量，query() 时自动做语义匹配。
-    不需要额外调用 Anthropic Embeddings API。
+    文档和查询向量由 DashScope text-embedding-v4 显式生成，
+    ChromaDB 只负责保存与近邻检索，不会加载默认 embedding 模型。
     """
 
     COLLECTION_NAME = "knowledge_base"
-    PARENT_COLLECTION_NAME = "knowledge_base_parent"
-    CHILD_COLLECTION_NAME = "knowledge_base_child"
+    PARENT_COLLECTION_NAME = "knowledge_base_parent_v4"
+    CHILD_COLLECTION_NAME = "knowledge_base_child_v4"
     DEFAULT_RECALL_TOP_K = 20
     DEFAULT_RRF_K = 60
     DEFAULT_RERANK_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
     DEFAULT_RERANK_SCORE_THRESHOLD = 0.25
+    DEFAULT_RERANK_TIMEOUT_SECONDS = 20.0
+    DEFAULT_RERANK_CANDIDATE_K = 4
 
     def __init__(
         self,
@@ -59,13 +61,30 @@ class KnowledgeBase:
         self._bm25_avgdl = 0.0
         self._hybrid_recall_k = self._read_int_env("RAG_HYBRID_RECALL_K", self.DEFAULT_RECALL_TOP_K)
         self._rrf_k = self._read_int_env("RAG_RRF_K", self.DEFAULT_RRF_K)
-        self._rerank_url = os.getenv("DASHSCOPE_RERANK_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks").strip()
+        self._rerank_provider = os.getenv("RERANK_PROVIDER", "dashscope").strip().lower() or "dashscope"
+        self._rerank_url = os.getenv(
+            "RERANK_URL",
+            os.getenv("DASHSCOPE_RERANK_URL", "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"),
+        ).strip()
         self._rerank_api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
         self._rerank_model = os.getenv("DASHSCOPE_RERANK_MODEL", "qwen3-rerank").strip() or "qwen3-rerank"
         self._rerank_instruct = os.getenv("DASHSCOPE_RERANK_INSTRUCT", self.DEFAULT_RERANK_INSTRUCT).strip() or self.DEFAULT_RERANK_INSTRUCT
         self._rerank_score_threshold = self._read_float_env("RAG_RERANK_SCORE_THRESHOLD", self.DEFAULT_RERANK_SCORE_THRESHOLD)
+        self._rerank_timeout_seconds = self._read_float_env(
+            "RAG_RERANK_TIMEOUT_SECONDS",
+            self.DEFAULT_RERANK_TIMEOUT_SECONDS,
+        )
+        self._rerank_candidate_k = self._read_int_env(
+            "RAG_RERANK_CANDIDATE_K",
+            self.DEFAULT_RERANK_CANDIDATE_K,
+        )
+        try:
+            self._embedding_client = DashScopeEmbeddingClient.from_env()
+        except EmbeddingUnavailable as ex:
+            self._embedding_client = None
+            logger.warning(f"DashScope text-embedding-v4 unavailable; vector recall disabled: {ex}")
 
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
+        # 优先连接独立 ChromaDB 服务，连接失败时使用本地持久化模式。
         self._use_server = False
         try:
             self._client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
@@ -79,15 +98,16 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 所有活动集合只接受调用方显式传入的 v4 向量。
         self._parent_collection = self._client.get_or_create_collection(
             name=self.PARENT_COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库父块"},
+            embedding_function=None,
         )
         self._child_collection = self._client.get_or_create_collection(
             name=self.CHILD_COLLECTION_NAME,
             metadata={"description": "EchoMind RAG 知识库子块索引"},
+            embedding_function=None,
         )
         # 兼容旧调用和旧测试桩
         self._collection = self._child_collection
@@ -165,9 +185,21 @@ class KnowledgeBase:
                 })
 
             if parent_ids:
-                self._parent_collection.add(ids=parent_ids, documents=parent_docs, metadatas=parent_metas)
+                parent_embeddings = self._require_embedding_client().embed_documents(parent_docs)
+                self._parent_collection.add(
+                    ids=parent_ids,
+                    documents=parent_docs,
+                    metadatas=parent_metas,
+                    embeddings=parent_embeddings,
+                )
             if child_ids:
-                self._child_collection.add(ids=child_ids, documents=child_docs, metadatas=child_metas)
+                child_embeddings = self._require_embedding_client().embed_documents(child_docs)
+                self._child_collection.add(
+                    ids=child_ids,
+                    documents=child_docs,
+                    metadatas=child_metas,
+                    embeddings=child_embeddings,
+                )
                 logger.info(f"知识库导入完成: title={title} 父块={len(parent_ids)} 子块={len(child_ids)}")
                 self._child_records.extend(child_records)
                 total_added += len(parent_ids) + len(child_ids)
@@ -180,7 +212,14 @@ class KnowledgeBase:
         raw = os.getenv("KNOWLEDGE_AUTO_SEED", "").strip().lower()
         return raw in {"1", "true", "yes", "on"}
 
-    def search(self, query: str, top_k: int = 5, recall_k: Optional[int] = None) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        recall_k: Optional[int] = None,
+        *,
+        skip_rerank: bool = False,
+    ) -> List[Dict[str, Any]]:
         """
         混合检索：向量召回 + BM25 召回 → RRF 融合 → qwen3-rerank 重排。
 
@@ -193,6 +232,8 @@ class KnowledgeBase:
         vector_hits = self._vector_recall(query, top_n=resolved_recall_k)
         bm25_hits = self._bm25_recall(query, top_n=resolved_recall_k)
         fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=resolved_recall_k)
+        if skip_rerank:
+            return self._attach_parent_context(fused_hits)
         reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
         return self._attach_parent_context(reranked)
 
@@ -202,22 +243,27 @@ class KnowledgeBase:
         top_k: int = 5,
         recall_k: Optional[int] = None,
         trace: Any = None,
+        *,
+        skip_rerank: bool = False,
     ) -> List[Dict[str, Any]]:
         if trace is None:
-            return self.search(query, top_k=top_k, recall_k=recall_k)
+            return self.search(query, top_k=top_k, recall_k=recall_k, skip_rerank=skip_rerank)
 
         resolved_recall_k = max(
             top_k,
             int(recall_k) if recall_k is not None else self._resolve_recall_k(top_k),
         )
-        with trace.stage("knowledge.vector_recall"):
-            vector_hits = self._vector_recall(query, top_n=resolved_recall_k)
+        with trace.stage("knowledge.vector_recall") as stage:
+            vector_hits = self._vector_recall(query, top_n=resolved_recall_k, vector_meta=stage.meta)
         with trace.stage("knowledge.bm25_recall"):
             bm25_hits = self._bm25_recall(query, top_n=resolved_recall_k)
         with trace.stage("knowledge.rrf_fuse"):
             fused_hits = self._fuse_recall_results(vector_hits, bm25_hits, top_n=resolved_recall_k)
-        with trace.stage("knowledge.rerank"):
-            reranked = self._rerank_candidates(query, fused_hits, top_n=top_k)
+        if skip_rerank:
+            reranked = fused_hits
+        else:
+            with trace.stage("knowledge.rerank") as stage:
+                reranked = self._rerank_candidates(query, fused_hits, top_n=top_k, rerank_meta=stage.meta)
         with trace.stage("knowledge.attach_parent_context"):
             return self._attach_parent_context(reranked)
 
@@ -244,10 +290,31 @@ class KnowledgeBase:
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
         recall_k = params.get("recall_k")
+        skip_rerank = bool(params.get("skip_rerank", False))
         trace = None
         if isinstance(context, dict):
             trace = context.get("trace")
-        return self.search_with_trace(query, top_k=top_k, recall_k=recall_k, trace=trace)
+        return self.search_with_trace(
+            query,
+            top_k=top_k,
+            recall_k=recall_k,
+            trace=trace,
+            skip_rerank=skip_rerank,
+        )
+
+    async def rerank_handler(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        top_k: int,
+        context: Any = None,
+    ) -> List[Dict[str, Any]]:
+        """Rerank the merged multi-query candidate set exactly once."""
+        candidate_limit = max(
+            top_k,
+            getattr(self, "_rerank_candidate_k", self.DEFAULT_RERANK_CANDIDATE_K),
+        )
+        return self._rerank_candidates(query, candidates[:candidate_limit], top_n=top_k)
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
@@ -336,19 +403,51 @@ class KnowledgeBase:
             return max(top_k, min(baseline, child_count))
         return baseline
 
-    def _vector_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
+    def _vector_recall(
+        self,
+        query: str,
+        top_n: int,
+        vector_meta: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         child_collection = self._get_child_collection()
-        if child_collection is None:
+        embedding_client = getattr(self, "_embedding_client", None)
+        if child_collection is None or embedding_client is None:
+            if vector_meta is not None:
+                vector_meta.update({
+                    "provider": "dashscope",
+                    "model": DashScopeEmbeddingClient.DEFAULT_MODEL,
+                    "dimension": DashScopeEmbeddingClient.DEFAULT_DIMENSION,
+                    "request_size": 1,
+                    "fallback_used": True,
+                })
             return []
 
         try:
+            query_embedding = embedding_client.embed_query(query)
             results = child_collection.query(
-                query_texts=[query],
+                query_embeddings=[query_embedding],
                 n_results=max(top_n, 1),
             )
         except Exception as ex:
             logger.warning(f"向量召回失败: {ex}")
+            if vector_meta is not None:
+                vector_meta.update({
+                    "provider": "dashscope",
+                    "model": getattr(embedding_client, "model", DashScopeEmbeddingClient.DEFAULT_MODEL),
+                    "dimension": getattr(embedding_client, "dimension", DashScopeEmbeddingClient.DEFAULT_DIMENSION),
+                    "request_size": 1,
+                    "fallback_used": True,
+                })
             return []
+
+        if vector_meta is not None:
+            vector_meta.update({
+                "provider": "dashscope",
+                "model": getattr(embedding_client, "model", DashScopeEmbeddingClient.DEFAULT_MODEL),
+                "dimension": getattr(embedding_client, "dimension", DashScopeEmbeddingClient.DEFAULT_DIMENSION),
+                "request_size": 1,
+                "fallback_used": False,
+            })
 
         docs = self._flatten_result_rows(results.get("documents", []))
         metas = self._flatten_result_rows(results.get("metadatas", []))
@@ -363,6 +462,12 @@ class KnowledgeBase:
 
         hits.sort(key=lambda item: item.get("vector_score", 0.0), reverse=True)
         return hits[:top_n]
+
+    def _require_embedding_client(self) -> DashScopeEmbeddingClient:
+        embedding_client = getattr(self, "_embedding_client", None)
+        if embedding_client is None:
+            raise EmbeddingUnavailable("DashScope text-embedding-v4 is required for knowledge import")
+        return embedding_client
 
     def _bm25_recall(self, query: str, top_n: int) -> List[Dict[str, Any]]:
         self._ensure_bm25_index()
@@ -443,13 +548,30 @@ class KnowledgeBase:
             item["score"] = round(float(item.get("rrf_score", 0.0)), 4)
         return items[:top_n]
 
-    def _rerank_candidates(self, query: str, candidates: List[Dict[str, Any]], top_n: int) -> List[Dict[str, Any]]:
-        if len(candidates) <= top_n:
-            return self._apply_rerank_scores(candidates)
+    def _rerank_candidates(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        top_n: int,
+        rerank_meta: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            if rerank_meta is not None:
+                rerank_meta.update({
+                    "provider": getattr(self, "_rerank_provider", "dashscope"),
+                    "candidate_count": 0,
+                    "returned_candidate_count": 0,
+                    "fallback_used": False,
+                    "rerank_applied": False,
+                })
+            return []
+
+        if getattr(self, "_rerank_provider", "dashscope") == "tei":
+            return self._rerank_with_tei(query, candidates, top_n, rerank_meta=rerank_meta)
 
         api_key = getattr(self, "_rerank_api_key", "").strip()
         if not api_key:
-            return self._apply_rerank_scores(candidates[:top_n])
+            return self._apply_rerank_scores(candidates[:top_n], provider="rrf_fallback")
 
         payload = {
             "model": getattr(self, "_rerank_model", "qwen3-rerank"),
@@ -489,14 +611,88 @@ class KnowledgeBase:
                     continue
                 updated["rerank_score"] = rerank_score
                 updated["score"] = rerank_score
+                updated["rerank_applied"] = True
+                updated["rerank_provider"] = "dashscope"
                 reranked.append(updated)
 
             if reranked:
+                if rerank_meta is not None:
+                    rerank_meta.update({
+                        "provider": "dashscope",
+                        "candidate_count": len(candidates),
+                        "returned_candidate_count": len(reranked[:top_n]),
+                        "fallback_used": False,
+                        "rerank_applied": True,
+                    })
                 return reranked[:top_n]
         except Exception as ex:
             logger.warning(f"qwen3-rerank 调用失败，回退到 RRF 排序: {ex}")
 
-        return self._apply_rerank_scores(candidates[:top_n])
+        return self._apply_rerank_scores(candidates[:top_n], provider="rrf_fallback")
+
+    def _rerank_with_tei(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        top_n: int,
+        rerank_meta: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        try:
+            response = httpx.post(
+                self._rerank_url,
+                json={
+                    "query": query,
+                    "texts": [str(item.get("content", ""))[:4000] for item in candidates],
+                    "return_text": False,
+                    "truncate": True,
+                },
+                timeout=getattr(self, "_rerank_timeout_seconds", self.DEFAULT_RERANK_TIMEOUT_SECONDS),
+            )
+            response.raise_for_status()
+            results = response.json()
+            if not isinstance(results, list):
+                raise ValueError("TEI rerank response must be a list")
+
+            reranked: List[Dict[str, Any]] = []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                index = item.get("index")
+                if not isinstance(index, int) or not (0 <= index < len(candidates)):
+                    continue
+                updated = dict(candidates[index])
+                rerank_score = round(float(item.get("score", updated.get("score", 0.0))), 4)
+                if rerank_score < getattr(self, "_rerank_score_threshold", self.DEFAULT_RERANK_SCORE_THRESHOLD):
+                    continue
+                updated["rerank_score"] = rerank_score
+                updated["score"] = rerank_score
+                updated["rerank_applied"] = True
+                updated["rerank_provider"] = "tei"
+                reranked.append(updated)
+
+            if reranked:
+                if rerank_meta is not None:
+                    rerank_meta.update({
+                        "provider": "tei",
+                        "candidate_count": len(candidates),
+                        "returned_candidate_count": len(reranked[:top_n]),
+                        "fallback_used": False,
+                        "rerank_applied": True,
+                    })
+                return reranked[:top_n]
+        except Exception as ex:
+            logger.warning(f"TEI rerank failed; falling back to RRF: {ex}")
+
+        fallback = self._apply_rerank_scores(candidates[:top_n], provider="rrf_fallback")
+        if rerank_meta is not None:
+            rerank_meta.update({
+                "provider": "tei",
+                "candidate_count": len(candidates),
+                "returned_candidate_count": len(fallback),
+                "fallback_used": True,
+                "rerank_applied": False,
+            })
+        return fallback
 
     def _attach_parent_context(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not items:
@@ -545,13 +741,20 @@ class KnowledgeBase:
             enriched.append(updated)
         return enriched
 
-    def _apply_rerank_scores(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _apply_rerank_scores(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        provider: str,
+    ) -> List[Dict[str, Any]]:
         ranked: List[Dict[str, Any]] = []
         for item in items:
             updated = dict(item)
             if "rerank_score" not in updated:
                 updated["rerank_score"] = round(float(updated.get("rrf_score", updated.get("score", 0.0))), 4)
             updated["score"] = updated["rerank_score"]
+            updated["rerank_applied"] = False
+            updated["rerank_provider"] = provider
             ranked.append(updated)
         return ranked
 

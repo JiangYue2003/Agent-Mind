@@ -1,10 +1,8 @@
 import asyncio
-import os
 import pathlib
 import sys
 import types
 import unittest
-from unittest.mock import patch
 
 
 if "dashscope" not in sys.modules:
@@ -22,60 +20,72 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.intent_recognizer import IntentRecognizer
+from core.intent_recognizer import _TEMPLATES, IntentCategory, IntentRecognizer
 
 
-class _FakeEmbeddingsResponse:
-    status_code = 200
-    output = {
-        "embeddings": [
-            {"embedding": [0.11, 0.22, 0.33]}
-        ]
-    }
+class _EmbeddingClient:
+    def __init__(self):
+        self.document_calls = []
+        self.query_calls = []
+
+    def embed_documents(self, texts):
+        self.document_calls.append(list(texts))
+        return [[float(index), 1.0] for index, _ in enumerate(texts)]
+
+    def embed_query(self, text):
+        self.query_calls.append(text)
+        return [1.0, 1.0]
+
+
+class _UnavailableEmbeddingClient:
+    def embed_documents(self, texts):
+        raise RuntimeError("DashScope unavailable")
+
+    def embed_query(self, text):
+        raise RuntimeError("DashScope unavailable")
 
 
 class IntentRecognizerEmbeddingTests(unittest.TestCase):
-    def test_dashscope_embedding_enabled_even_with_third_party_llm_base_url(self):
-        with patch.dict(os.environ, {
-            "DASHSCOPE_API_KEY": "test-key",
-            "INTENT_EMBEDDING_PROVIDER": "dashscope",
-            "INTENT_EMBEDDING_MODEL": "text-embedding-v3",
-        }, clear=False):
-            recognizer = IntentRecognizer(
-                api_key="llm-key",
-                base_url="https://api.deepseek.com/anthropic",
-                model="deepseek-chat",
-            )
+    def _recognizer(self):
+        recognizer = IntentRecognizer(api_key="llm-key", base_url="https://example.invalid/anthropic")
+        recognizer._embedding_enabled = True
+        return recognizer
 
-        self.assertTrue(recognizer._embedding_enabled)
+    def test_template_embeddings_are_batched_as_dashscope_documents(self):
+        recognizer = self._recognizer()
+        recognizer._embedding_client = _EmbeddingClient()
 
-    def test_embed_text_prefers_dashscope_provider(self):
-        with patch.dict(os.environ, {
-            "DASHSCOPE_API_KEY": "test-key",
-            "INTENT_EMBEDDING_PROVIDER": "dashscope",
-            "INTENT_EMBEDDING_MODEL": "text-embedding-v3",
-        }, clear=False):
-            recognizer = IntentRecognizer(api_key="llm-key", base_url="https://api.deepseek.com/anthropic")
+        asyncio.run(recognizer._load_template_embeddings())
 
-        with patch("core.intent_recognizer.TextEmbedding.call", return_value=_FakeEmbeddingsResponse()) as mocked_call:
-            vector = asyncio.run(recognizer._embed_text("退款多久到账"))
+        expected_count = sum(len(texts) for texts in _TEMPLATES.values())
+        self.assertEqual(len(recognizer._embedding_client.document_calls), 1)
+        self.assertEqual(len(recognizer._embedding_client.document_calls[0]), expected_count)
 
-        self.assertEqual(vector, [0.11, 0.22, 0.33])
-        mocked_call.assert_called_once()
+    def test_message_embedding_uses_dashscope_query_vector(self):
+        recognizer = self._recognizer()
+        recognizer._embedding_client = _EmbeddingClient()
 
-    def test_embed_text_falls_back_to_local_vector_when_dashscope_fails(self):
-        with patch.dict(os.environ, {
-            "DASHSCOPE_API_KEY": "test-key",
-            "INTENT_EMBEDDING_PROVIDER": "dashscope",
-            "INTENT_EMBEDDING_MODEL": "text-embedding-v3",
-        }, clear=False):
-            recognizer = IntentRecognizer(api_key="llm-key", base_url="https://api.deepseek.com/anthropic")
+        vector = asyncio.run(recognizer._embed_text("退款多久到账"))
 
-        with patch("core.intent_recognizer.TextEmbedding.call", side_effect=RuntimeError("dashscope down")):
-            vector = asyncio.run(recognizer._embed_text("退款多久到账"))
+        self.assertEqual(vector, [1.0, 1.0])
+        self.assertEqual(recognizer._embedding_client.query_calls, ["退款多久到账"])
 
-        self.assertEqual(len(vector), 256)
-        self.assertTrue(any(value != 0.0 for value in vector))
+    def test_dashscope_failure_skips_embedding_branch_without_local_vector_fallback(self):
+        recognizer = self._recognizer()
+        recognizer._embedding_client = _UnavailableEmbeddingClient()
+        local_vector_used = []
+
+        def local_vector(text):
+            local_vector_used.append(text)
+            return [0.0, 0.0]
+
+        recognizer._local_embedding = local_vector
+
+        result = asyncio.run(recognizer._embedding_recognize("退款多久到账"))
+
+        self.assertEqual(result["intent"], IntentCategory.OTHER)
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(local_vector_used, [])
 
 
 if __name__ == "__main__":
