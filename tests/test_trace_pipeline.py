@@ -8,6 +8,7 @@ from enum import Enum
 from api import main as api_main
 from agents.agent_orchestrator import AgentResponse, AgentType, OrchestratorResult
 from core.intent_recognizer import IntentCategory, UrgencyLevel
+from workflow.intent_decider import DecisionMode, WorkflowDecision
 
 
 @dataclass
@@ -85,6 +86,17 @@ class _FakeToolManager:
         raise AssertionError("tool call should not happen in this trace test")
 
 
+class _FakeWorkflowDecider:
+    async def decide(self, message, intent, entities, history):
+        return WorkflowDecision(
+            mode=DecisionMode.KNOWLEDGE,
+            tools=["knowledge_search"],
+            specific_order=False,
+            confidence=0.96,
+            reason="用户在咨询通用退款时效",
+        )
+
+
 class _FakeOrchestrator:
     def __init__(self):
         self.requests = []
@@ -122,6 +134,7 @@ class TracePipelineTests(unittest.TestCase):
         self._original_orchestrator = api_main._orchestrator
         self._original_create_task = api_main.asyncio.create_task
         self._original_recognizer = getattr(api_main, "_chat_intent_recognizer", None)
+        self._original_workflow_decider = getattr(api_main, "_workflow_intent_decider", None)
         self._original_trace_store = getattr(api_main, "_trace_store", None)
         self._original_memory_module = sys.modules.get("memory.conversation_memory")
 
@@ -137,6 +150,7 @@ class TracePipelineTests(unittest.TestCase):
             reasoning="用户在问退款到账时效",
             latency_ms=4.2,
         ))
+        api_main._workflow_intent_decider = _FakeWorkflowDecider()
         api_main._trace_store = None
 
         fake_memory_module = types.ModuleType("memory.conversation_memory")
@@ -149,6 +163,7 @@ class TracePipelineTests(unittest.TestCase):
         api_main._orchestrator = self._original_orchestrator
         api_main.asyncio.create_task = self._original_create_task
         api_main._chat_intent_recognizer = self._original_recognizer
+        api_main._workflow_intent_decider = self._original_workflow_decider
         api_main._trace_store = self._original_trace_store
         if self._original_memory_module is None:
             sys.modules.pop("memory.conversation_memory", None)
@@ -171,6 +186,7 @@ class TracePipelineTests(unittest.TestCase):
         self.assertIn("chat.total", stage_names)
         self.assertIn("memory.read", stage_names)
         self.assertIn("intent.recognize", stage_names)
+        self.assertIn("workflow.decide", stage_names)
         self.assertIn("workflow.slot_check", stage_names)
         self.assertIn("workflow.planner", stage_names)
         self.assertIn("workflow.state_transition", stage_names)
@@ -180,6 +196,14 @@ class TracePipelineTests(unittest.TestCase):
 
         planner_stage = next(item for item in trace_payload["stages"] if item["name"] == "workflow.planner")
         self.assertEqual(planner_stage["meta"]["plan"]["next_action"], "retrieve")
+        decision_stage = next(item for item in trace_payload["stages"] if item["name"] == "workflow.decide")
+        self.assertEqual(decision_stage["meta"]["decision"]["mode"], "knowledge")
+        knowledge_stage = next(item for item in trace_payload["stages"] if item["name"] == "knowledge_context.build")
+        self.assertEqual(knowledge_stage["meta"]["retrieved_contexts"], [
+            "1. 标题: 退款政策\n   相关路径: 制度中心 > 财务 > 退款政策\n   相关度: 0.93\n"
+            "   命中片段: 审核通过后，款项将在 5-7 个工作日内退回原支付账户。\n"
+            "   所属段落: 退款政策说明。审核通过后，款项将在 5-7 个工作日内退回原支付账户。"
+        ])
 
     def test_trace_records_knowledge_substages(self):
         response = asyncio.run(api_main.chat(api_main.ChatRequest(

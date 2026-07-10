@@ -8,6 +8,7 @@ from enum import Enum
 from api import main as api_main
 from agents.agent_orchestrator import AgentResponse, AgentType, OrchestratorResult
 from core.intent_recognizer import IntentCategory, UrgencyLevel
+from workflow.intent_decider import DecisionMode, WorkflowDecision
 
 
 @dataclass
@@ -28,6 +29,21 @@ class _FakeRecognizer:
     async def recognize(self, message: str, history=None):
         self.calls.append({"message": message, "history": history})
         return self._result
+
+
+class _FakeWorkflowDecider:
+    def __init__(self, decision):
+        self._decision = decision
+        self.calls = []
+
+    async def decide(self, message, intent, entities, history):
+        self.calls.append({
+            "message": message,
+            "intent": intent,
+            "entities": entities,
+            "history": history,
+        })
+        return self._decision
 
 
 class _FakeMemory:
@@ -174,6 +190,7 @@ class ChatToolAugmentationTests(unittest.TestCase):
         self._original_orchestrator = api_main._orchestrator
         self._original_create_task = api_main.asyncio.create_task
         self._original_recognizer = getattr(api_main, "_chat_intent_recognizer", None)
+        self._original_workflow_decider = getattr(api_main, "_workflow_intent_decider", None)
         self._original_memory_module = sys.modules.get("memory.conversation_memory")
 
         self.fake_memory = _FakeMemory()
@@ -195,6 +212,7 @@ class ChatToolAugmentationTests(unittest.TestCase):
         api_main._orchestrator = self._original_orchestrator
         api_main.asyncio.create_task = self._original_create_task
         api_main._chat_intent_recognizer = self._original_recognizer
+        api_main._workflow_intent_decider = self._original_workflow_decider
         if self._original_memory_module is None:
             sys.modules.pop("memory.conversation_memory", None)
         else:
@@ -322,6 +340,42 @@ class ChatToolAugmentationTests(unittest.TestCase):
         self.assertIn("[知识库检索结果]", orch_req.context)
         self.assertNotIn("[工具增强上下文]", orch_req.context)
 
+    def test_chat_uses_knowledge_for_delivery_and_invoice_rules_without_order_id(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.QUERY,
+            confidence=0.95,
+            urgency=UrgencyLevel.LOW,
+            entities={"order_id": [], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户咨询通用规则",
+            latency_ms=2.0,
+        ))
+        decider = _FakeWorkflowDecider(WorkflowDecision(
+            mode=DecisionMode.KNOWLEDGE,
+            tools=["knowledge_search"],
+            specific_order=False,
+            confidence=0.94,
+            reason="问题可以由知识库直接回答",
+        ))
+        api_main._workflow_intent_decider = decider
+
+        for index, message in enumerate([
+            "有单号但没有物流记录正常吗？",
+            "物流一直不动什么时候找客服？",
+            "订单什么时候可以申请电子发票？",
+        ]):
+            response = asyncio.run(api_main.chat(api_main.ChatRequest(
+                message=message,
+                user_id="u123",
+                conv_id=f"conv-knowledge-route-{index}",
+            )))
+
+            self.assertTrue(response.knowledge_used)
+            self.assertNotIn("订单号", response.response)
+
+        self.assertEqual(len(decider.calls), 3)
+        self.assertEqual(len(self.fake_tool_manager.search_calls), 3)
+        self.assertEqual(self.fake_tool_manager.call_calls, [])
+
     def test_chat_combines_knowledge_and_order_lookup_for_mixed_billing_question(self):
         api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
             intent=IntentCategory.BILLING,
@@ -368,6 +422,34 @@ class ChatToolAugmentationTests(unittest.TestCase):
         orch_req = self.fake_orchestrator.requests[0]
         self.assertIn("[shipment_track]", orch_req.context)
         self.assertIn("顺丰速运", orch_req.context)
+
+    def test_chat_uses_order_id_resolved_by_workflow_decision(self):
+        api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(
+            intent=IntentCategory.QUERY,
+            confidence=0.95,
+            urgency=UrgencyLevel.LOW,
+            entities={"order_id": [], "product": [], "date": [], "amount": [], "error_code": []},
+            reasoning="用户继续查询上一笔订单的物流",
+            latency_ms=2.0,
+        ))
+        api_main._workflow_intent_decider = _FakeWorkflowDecider(WorkflowDecision(
+            mode=DecisionMode.LIVE_RECORD,
+            tools=["shipment_track"],
+            specific_order=True,
+            confidence=0.95,
+            reason="用户在查询具体订单的实时物流",
+            order_id="ORD20250701001",
+        ))
+
+        response = asyncio.run(api_main.chat(api_main.ChatRequest(
+            message="现在到哪了？",
+            user_id="u123",
+            conv_id="conv-history-order-1",
+        )))
+
+        self.assertFalse(response.knowledge_used)
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["name"], "shipment_track")
+        self.assertEqual(self.fake_tool_manager.call_calls[0]["params"]["order_id"], "ORD20250701001")
 
     def test_chat_uses_refund_create_for_explicit_refund_request_with_order_id(self):
         api_main._chat_intent_recognizer = _FakeRecognizer(_FakeIntentResult(

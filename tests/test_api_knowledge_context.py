@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -15,8 +17,10 @@ class _FakeSearchResult:
 class _FakeToolManager:
     def __init__(self):
         self._tools = {}
+        self.calls = []
 
     async def search_with_rewrite(self, tool_name, message, top_k=3, recall_k=None, context=None):
+        self.calls.append({"tool_name": tool_name, "message": message, "top_k": top_k})
         return _FakeSearchResult([
             {
                 "title": "退款政策",
@@ -68,6 +72,14 @@ class BuildKnowledgeContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("版本号:", context)
         self.assertNotIn("生效时间:", context)
         self.assertIn("命中片段: 审核通过后，款项将在 5-7 个工作日内退回原支付账户。", context)
+
+    async def test_build_knowledge_context_uses_answer_top_k_default(self):
+        with mock.patch.dict(os.environ, {"RAG_ANSWER_TOP_K": "5"}):
+            context, used = await api_main._build_knowledge_context("退款多久到账")
+
+        self.assertTrue(used)
+        self.assertTrue(context)
+        self.assertEqual(api_main._tool_manager.calls[-1]["top_k"], 5)
 
     async def test_export_knowledge_chunks_returns_chunk_metadata(self):
         client = TestClient(api_main.app)

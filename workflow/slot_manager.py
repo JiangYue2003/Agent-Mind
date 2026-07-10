@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from core.intent_recognizer import IntentCategory
+from workflow.intent_decider import WorkflowDecision
 
 
 @dataclass
@@ -15,6 +16,7 @@ class SlotAssessment:
     reason: str = ""
     should_lookup_order: bool = False
     should_handoff: bool = False
+    selected_tools: List[str] = field(default_factory=list)
 
     @property
     def requires_clarification(self) -> bool:
@@ -31,6 +33,7 @@ class SlotAssessment:
             "reason": self.reason,
             "should_lookup_order": self.should_lookup_order,
             "should_handoff": self.should_handoff,
+            "selected_tools": list(self.selected_tools),
         }
 
 
@@ -45,11 +48,15 @@ class SlotManager:
         message: str,
         intent: Optional[IntentCategory],
         entities: Optional[Dict[str, List[str]]],
+        decision: Optional[WorkflowDecision] = None,
     ) -> SlotAssessment:
         msg = (message or "").strip()
         lowered = msg.lower()
         normalized_entities = self._normalize_entities(entities)
         order_ids = normalized_entities.get("order_id", [])
+
+        if decision is not None:
+            return self._assess_decision(decision, order_ids)
 
         if self._is_handoff_request(lowered, intent):
             missing_optional_slots = []
@@ -105,6 +112,22 @@ class SlotManager:
         return SlotAssessment(
             primary_goal="direct_response",
             reason="问题不依赖知识检索或业务工具，可直接回复",
+        )
+
+    def _assess_decision(self, decision: WorkflowDecision, order_ids: List[str]) -> SlotAssessment:
+        order_id = decision.order_id or (order_ids[0] if len(order_ids) == 1 else "")
+        required_slots = decision.required_slots
+        needs_order_id = "order_id" in required_slots
+        missing_required = ["order_id"] if needs_order_id and not order_id and decision.should_clarify else []
+        return SlotAssessment(
+            primary_goal=decision.mode.value,
+            required_slots=required_slots,
+            missing_required_slots=missing_required,
+            missing_optional_slots=["order_id"] if needs_order_id and not order_id and not missing_required else [],
+            clarify_question=self._clarify_question("order_id") if missing_required else "",
+            reason=decision.reason,
+            should_lookup_order="order_lookup" in decision.tools,
+            selected_tools=list(decision.tools),
         )
 
     def _normalize_entities(self, entities: Optional[Dict[str, List[str]]]) -> Dict[str, List[str]]:

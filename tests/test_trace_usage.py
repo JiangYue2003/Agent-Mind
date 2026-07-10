@@ -35,7 +35,11 @@ class _FakeResponse:
 
 
 class _FakeMessages:
+    def __init__(self):
+        self.calls = []
+
     async def create(self, **kwargs):
+        self.calls.append(kwargs)
         return _FakeResponse()
 
 
@@ -110,6 +114,25 @@ class TraceUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(usage["completion_tokens"], 7)
         self.assertEqual(usage["total_tokens"], 18)
         self.assertEqual(usage["reasoning_tokens"], 2)
+
+    async def test_knowledge_answer_prompt_requires_grounded_short_response(self):
+        client = _FakeClient()
+        agent = GeneralAgent(client, "deepseek-chat")
+        req = Request(
+            message="现货付款后多久发货？",
+            user_id="u123",
+            conv_id="c123",
+            context="[知识库检索结果]\n现货订单通常在支付成功后 24-48 小时内发货。",
+        )
+
+        await agent.handle(req)
+
+        call = client.messages.calls[0]
+        self.assertEqual(call["max_tokens"], 450)
+        self.assertIn("仅依据", call["system"])
+        self.assertIn("先给出直接结论", call["system"])
+        self.assertIn("不要补充", call["system"])
+        self.assertIn("不是实时订单事实", call["system"])
 
     def test_trace_store_writes_jsonl_when_directory_enabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:

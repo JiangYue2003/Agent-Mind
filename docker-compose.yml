@@ -118,6 +118,7 @@ services:
       - "RERANK_URL=${RERANK_URL:-http://host.docker.internal:18080/rerank}"
       - RAG_HYBRID_RECALL_K=12
       - RAG_RERANK_CANDIDATE_K=12
+      - RAG_ANSWER_TOP_K=5
       - RAG_RERANK_TIMEOUT_SECONDS=20
       - RAG_RERANK_SCORE_THRESHOLD=0
     volumes:
@@ -153,7 +154,7 @@ services:
       - EVAL_DATASET_PATH=/app/evaluation/datasets/customer_service_v1.jsonl
       - EVAL_WORKFLOW_DATASET=/app/evaluation/datasets/customer_service_workflow_v1.jsonl
       - EVAL_OUTPUT_DIR=/app/data/eval
-      - EVAL_TOP_K=3
+      - EVAL_TOP_K=5
       - EVAL_RECALL_K=12
       - EVAL_REQUIRE_RERANK=true
       - EVAL_REQUIRED_RERANK_PROVIDER=tei

@@ -39,6 +39,19 @@ class CustomerServiceRagasDatasetTests(unittest.TestCase):
             self.assertEqual(case["turns"][1]["expected_behavior"], "continue_workflow")
             self.assertIn("订单号", case["turns"][1]["user_input"])
 
+    def test_workflow_smoke_dataset_keeps_refund_and_shipment_regressions(self):
+        root = Path(__file__).resolve().parents[1]
+        cases = load_eval_cases(
+            root / "evaluation" / "datasets" / "customer_service_workflow_smoke_v1.jsonl"
+        )
+
+        self.assertEqual(
+            [case["case_id"] for case in cases],
+            ["workflow-refund-001", "workflow-shipment-001"],
+        )
+        self.assertTrue(all(case["evaluation_mode"] == "workflow" for case in cases))
+        self.assertTrue(all(len(case["turns"]) == 2 for case in cases))
+
 
 if __name__ == "__main__":
     unittest.main()

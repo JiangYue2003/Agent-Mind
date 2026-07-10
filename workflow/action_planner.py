@@ -1,6 +1,8 @@
 from typing import Dict, List, Optional
 
 from core.intent_recognizer import IntentCategory
+from workflow.intent_decider import WorkflowDecision
+from workflow.tool_schema import required_slots_for_tools
 from workflow.action_models import (
     ActionItem,
     ActionType,
@@ -32,11 +34,21 @@ class ActionPlanner:
         slot_assessment: Optional[SlotAssessment] = None,
         intent_confidence: float = 0.0,
         intent_reasoning: str = "",
+        decision: Optional[WorkflowDecision] = None,
     ) -> WorkflowPlan:
         assessment = slot_assessment or self._slot_manager.assess(message, intent, entities)
         confidence = self._confidence(intent_confidence, assessment)
         normalized_entities = self._normalize_entities(entities)
         route_plan = self._route_plan(message, intent, assessment)
+
+        if decision is not None:
+            return self._plan_from_decision(
+                intent=intent,
+                entities=normalized_entities,
+                assessment=assessment,
+                route_plan=route_plan,
+                decision=decision,
+            )
 
         if assessment.requires_clarification:
             actions = [
@@ -225,6 +237,80 @@ class ActionPlanner:
             confidence=confidence,
         )
 
+    def _plan_from_decision(
+        self,
+        intent: Optional[IntentCategory],
+        entities: Dict[str, List[str]],
+        assessment: SlotAssessment,
+        route_plan: RoutePlan,
+        decision: WorkflowDecision,
+    ) -> WorkflowPlan:
+        if assessment.requires_clarification:
+            return WorkflowPlan(
+                complexity=ComplexityLevel.SINGLE_DOMAIN,
+                primary_intent=intent.value if intent else "other",
+                primary_goal=decision.mode.value,
+                actions=[
+                    ActionItem(
+                        id="a1",
+                        type=ActionType.CLARIFY_SLOT,
+                        objective="向用户追问缺失槽位",
+                        domain="conversation",
+                        required_slots=list(assessment.missing_required_slots),
+                        output_key="clarify.prompt",
+                        reason=decision.reason,
+                    )
+                ],
+                route_plan=route_plan,
+                stop_conditions=StopConditions(max_actions=1, max_parallel_groups=1, max_failures=0),
+                reason=decision.reason,
+                confidence=decision.confidence,
+                missing_slots=list(assessment.missing_required_slots),
+                clarify_prompt=assessment.clarify_question,
+            )
+
+        order_id = decision.order_id or (entities.get("order_id") or [""])[0]
+        selected_tools = list(decision.tools)
+        follow_up_prompt = ""
+        if decision.requires_order_id and not order_id:
+            selected_tools = [tool for tool in selected_tools if tool == "knowledge_search"]
+            follow_up_prompt = "如需查询该订单的实时状态，请提供订单号。"
+
+        actions: List[ActionItem] = []
+        if "knowledge_search" in selected_tools:
+            actions.append(self._retrieve_policy_action(f"a{len(actions) + 1}", decision.mode.value))
+        if "order_lookup" in selected_tools:
+            actions.append(self._lookup_order_action(f"a{len(actions) + 1}"))
+        if "shipment_track" in selected_tools:
+            actions.append(self._track_shipment_action(f"a{len(actions) + 1}"))
+        if "refund_create" in selected_tools:
+            actions.append(self._create_refund_action(f"a{len(actions) + 1}"))
+
+        if actions:
+            actions.append(
+                self._synthesize_action(
+                    f"a{len(actions) + 1}",
+                    depends_on=[action.id for action in actions],
+                    multi_agent=bool(route_plan.supporting_agents),
+                )
+            )
+        else:
+            actions.append(self._synthesize_action("a1", depends_on=[], multi_agent=bool(route_plan.supporting_agents)))
+
+        evidence_actions = len(actions) - 1
+        return WorkflowPlan(
+            complexity=ComplexityLevel.MULTI_SOURCE if evidence_actions > 1 else ComplexityLevel.SINGLE_DOMAIN,
+            primary_intent=intent.value if intent else "other",
+            primary_goal=decision.mode.value,
+            secondary_intents=self._secondary_intents(route_plan),
+            actions=actions,
+            route_plan=route_plan,
+            reason=decision.reason,
+            confidence=decision.confidence,
+            missing_slots=["order_id"] if follow_up_prompt else [],
+            follow_up_prompt=follow_up_prompt,
+        )
+
     def _confidence(self, intent_confidence: float, assessment: SlotAssessment) -> float:
         base = intent_confidence if intent_confidence > 0 else 0.75
         if assessment.requires_clarification or assessment.should_handoff:
@@ -335,7 +421,7 @@ class ActionPlanner:
             type=ActionType.LOOKUP_ORDER,
             objective="查询订单实时状态",
             domain="orders",
-            required_slots=["order_id"],
+            required_slots=required_slots_for_tools(["order_lookup"]),
             can_parallel=True,
             tool_name="order_lookup",
             output_key="order.snapshot",
@@ -347,7 +433,7 @@ class ActionPlanner:
             type=ActionType.TRACK_SHIPMENT,
             objective="查询物流实时轨迹",
             domain="shipping",
-            required_slots=["order_id"],
+            required_slots=required_slots_for_tools(["shipment_track"]),
             can_parallel=True,
             tool_name="shipment_track",
             output_key="shipment.snapshot",
@@ -359,7 +445,7 @@ class ActionPlanner:
             type=ActionType.CREATE_REFUND,
             objective="提交退款申请",
             domain="billing",
-            required_slots=["order_id"],
+            required_slots=required_slots_for_tools(["refund_create"]),
             tool_name="refund_create",
             output_key="refund.result",
         )

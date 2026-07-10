@@ -29,6 +29,16 @@ from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLeve
 
 logger = logging.getLogger(__name__)
 
+_KNOWLEDGE_GROUNDING_INSTRUCTION = (
+    "当背景信息含有[知识库检索结果]时，先给出直接结论，再补充必要条件。"
+    "仅依据其中明确提供的事实回答，不要补充未经支持的数字、时效、政策或操作步骤。"
+    "信息不足时直接说明知识库未提供该信息。"
+    "除非上下文或工作流明确要求实时查询或执行操作，否则不要索取订单号。"
+    "会话摘要、相关历史和用户画像不是实时订单事实；不得据此声称订单状态、物流或退款结果。"
+    "这类实时事实只能依据[order_lookup]、[shipment_track]或[refund_create]工具结果。"
+    "回答保持简短，不要重复背景信息。"
+)
+
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
@@ -148,7 +158,7 @@ class BaseAgent:
         if trace is None:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=1024,
+                max_tokens=450,
                 system=self.system_prompt,
                 messages=messages,
             )
@@ -156,7 +166,7 @@ class BaseAgent:
             with trace.stage(f"agent.llm_call.{self.agent_type.value}", model=self._model):
                 resp = await self._client.messages.create(
                     model=self._model,
-                    max_tokens=1024,
+                    max_tokens=450,
                     system=self.system_prompt,
                     messages=messages,
                 )
@@ -176,6 +186,7 @@ class GeneralAgent(BaseAgent):
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        + _KNOWLEDGE_GROUNDING_INSTRUCTION
     )
 
 
@@ -192,6 +203,7 @@ class BillingAgent(BaseAgent):
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
         "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        + _KNOWLEDGE_GROUNDING_INSTRUCTION
     )
 
 

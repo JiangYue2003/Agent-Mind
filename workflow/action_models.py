@@ -209,6 +209,7 @@ class WorkflowPlan:
     confidence: float = 0.0
     missing_slots: List[str] = field(default_factory=list)
     clarify_prompt: str = ""
+    follow_up_prompt: str = ""
 
     def __post_init__(self) -> None:
         self.complexity = ComplexityLevel(self.complexity)
@@ -271,6 +272,7 @@ class WorkflowPlan:
             "need_handoff": self.need_handoff,
             "missing_slots": list(self.missing_slots),
             "clarify_prompt": self.clarify_prompt,
+            "follow_up_prompt": self.follow_up_prompt,
             "reason": self.reason,
             "confidence": self.confidence,
             "actions": [action.to_dict() for action in self.actions],

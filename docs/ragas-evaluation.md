@@ -63,7 +63,62 @@ docker compose up -d --build echomind
 docker compose exec echomind curl -sS http://host.docker.internal:18080/health
 ```
 
-Then build and run the on-demand evaluation service:
+### Run from the host
+
+The Ragas runner can run from a host Conda environment. It calls the Docker
+application through its published port, so it uses `http://127.0.0.1:8000`,
+not the Compose-only `http://echomind:8000`. Datasets and reports are regular
+Windows paths; no Docker volume mounts are involved.
+
+Use Python 3.12 for the `ragas` environment, matching the evaluated Docker
+image. Python 3.14 may resolve newer transitive packages than the pinned
+container build.
+
+```powershell
+cd F:\AI-agent\EchoMind
+conda activate ragas
+python --version
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt -r evaluation/requirements-ragas.txt
+```
+
+Confirm the deployed application and the local reranker are ready:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+Invoke-RestMethod http://127.0.0.1:18080/health
+docker compose exec echomind printenv RERANK_URL
+```
+
+The final command must print `http://host.docker.internal:18080/rerank`.
+Then run the evaluator. `python -m dotenv run` loads the existing `.env` into
+the local process without printing API keys.
+
+```powershell
+python -m dotenv run -- python -m evaluation.ragas_runner `
+  --base-url http://127.0.0.1:8000 `
+  --dataset evaluation/datasets/customer_service_v1.jsonl `
+  --workflow-dataset evaluation/datasets/customer_service_workflow_v1.jsonl `
+  --output-dir data/eval `
+  --top-k 5 `
+  --recall-k 12 `
+  --require-rerank true `
+  --required-rerank-provider tei `
+  --max-concurrency 3
+```
+
+The report is written directly to `data\eval\ragas-<timestamp>.json`. To
+resume scoring a saved report without calling `/search` or `/chat` again:
+
+```powershell
+python -m dotenv run -- python -m evaluation.ragas_runner `
+  --resume data/eval/<run_id>.json `
+  --max-concurrency 3
+```
+
+### Run from Docker
+
+Alternatively, build and run the on-demand evaluation service:
 
 ```powershell
 docker compose --profile eval build ragas-eval
@@ -74,7 +129,7 @@ Optional environment variables are `EVAL_RUN_ID`, `EVAL_TOP_K`,
 `EVAL_RECALL_K`, `EVAL_REQUIRE_RERANK`, `EVAL_REQUIRED_RERANK_PROVIDER`,
 `EVAL_MAX_CONCURRENCY`, `EVAL_DATASET_PATH`, `EVAL_WORKFLOW_DATASET`, and
 `EVAL_OUTPUT_DIR`. The defaults recall 12 candidates before the local GPU
-reranker produces Top-K 3, require the TEI-compatible `tei` protocol marker
+reranker produces Top-K 5, require the TEI-compatible `tei` protocol marker
 for answerable knowledge cases, run at most three RAGAS
 metric tasks at once, and use the customer-service dataset plus workflow cases.
 
@@ -82,7 +137,7 @@ Query rewrites each perform hybrid recall, then their candidates are merged
 and deduplicated before one global TEI-compatible rerank. This prevents one user request
 from overwhelming the reranker with one rerank request per rewrite.
 The host-native `local_reranker` service scores the 12 highest RRF-scored
-candidates in one GPU batch before reranking to Top-K 3. Start it before the
+candidates in one GPU batch before reranking to Top-K 5. Start it before the
 Compose application and verify its `/health` endpoint from the `echomind`
 container. RAGAS scoring concurrency remains limited to three because that
 limit protects the remote evaluation-model API, not the reranker.

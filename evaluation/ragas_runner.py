@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import math
 import os
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,7 @@ def collect_deployed_records(
     cases: List[Dict[str, Any]],
     *,
     client: HttpClient,
+    run_id: str,
     top_k: int,
     recall_k: int | None = None,
     require_rerank: bool = False,
@@ -89,7 +91,7 @@ def collect_deployed_records(
     for case in cases:
         case_id = case["case_id"]
         user_id = str(case.get("user_id") or f"ragas-eval-{case_id}")
-        conv_id = str(case.get("conv_id") or f"ragas-eval-{case_id}")
+        conv_id = f"ragas-eval-{run_id}-{case_id}"
         evaluation_mode = str(case.get("evaluation_mode") or "knowledge")
         for turn_index, turn in enumerate(_case_turns(case)):
             question = turn["user_input"]
@@ -99,7 +101,7 @@ def collect_deployed_records(
             search_response = client.post("/search", params=search_params)
             search_response.raise_for_status()
             search_payload = search_response.json()
-            retrieved_contexts = _extract_contexts(search_payload.get("results", []))
+            diagnostic_retrieved_contexts = _extract_contexts(search_payload.get("results", []))
             rerank_applied = bool(search_payload.get("rerank_applied", False))
             rerank_providers = _extract_rerank_providers(search_payload.get("rerank_providers"))
             is_knowledge_case = not case["unanswerable"] and evaluation_mode == "knowledge"
@@ -127,10 +129,19 @@ def collect_deployed_records(
             response = str(chat_payload.get("response", "")).strip()
             if not response:
                 raise ValueError(f"chat response is empty for case {case_id} turn {turn_index}")
+            trace_id = str(chat_payload.get("trace_id", "")).strip()
+            retrieved_contexts = _load_chat_retrieved_contexts(
+                client=client,
+                trace_id=trace_id,
+                knowledge_used=bool(chat_payload.get("knowledge_used", False)),
+                case_id=case_id,
+                turn_index=turn_index,
+            )
 
             records.append({
                 "user_input": question,
                 "retrieved_contexts": retrieved_contexts,
+                "diagnostic_retrieved_contexts": diagnostic_retrieved_contexts,
                 "response": response,
                 "reference": turn["reference"],
                 "reference_contexts": turn["reference_contexts"],
@@ -142,8 +153,9 @@ def collect_deployed_records(
                 },
                 "chat": {
                     "knowledge_used": bool(chat_payload.get("knowledge_used", False)),
+                    "retrieved_context_source": "chat_trace" if retrieved_contexts else "none",
                     "latency_ms": chat_payload.get("latency_ms"),
-                    "trace_id": str(chat_payload.get("trace_id", "")),
+                    "trace_id": trace_id,
                 },
                 "metadata": {
                     "case_id": case_id,
@@ -353,6 +365,7 @@ def run_deployed_evaluation(
     records = collect_deployed_records(
         cases,
         client=client,
+        run_id=run_id,
         top_k=top_k,
         recall_k=recall_k,
         require_rerank=require_rerank,
@@ -463,7 +476,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--dataset", default=os.getenv("EVAL_DATASET_PATH", "evaluation/datasets/customer_service_v1.jsonl"))
     parser.add_argument("--output-dir", default=os.getenv("EVAL_OUTPUT_DIR", "data/eval"))
     parser.add_argument("--run-id", default=os.getenv("EVAL_RUN_ID", ""))
-    parser.add_argument("--top-k", type=int, default=int(os.getenv("EVAL_TOP_K", "3")))
+    parser.add_argument("--top-k", type=int, default=int(os.getenv("EVAL_TOP_K", "5")))
     parser.add_argument("--recall-k", type=int, default=int(os.getenv("EVAL_RECALL_K", "12")))
     parser.add_argument("--max-concurrency", type=int, default=int(os.getenv("EVAL_MAX_CONCURRENCY", "3")))
     parser.add_argument("--require-rerank", default=os.getenv("EVAL_REQUIRE_RERANK", "false"))
@@ -577,6 +590,37 @@ def _extract_rerank_providers(value: Any) -> List[str]:
     return sorted({str(item).strip() for item in value if str(item).strip()})
 
 
+def _load_chat_retrieved_contexts(
+    *,
+    client: HttpClient,
+    trace_id: str,
+    knowledge_used: bool,
+    case_id: str,
+    turn_index: int,
+) -> List[str]:
+    """Read the exact knowledge prompt blocks used by the deployed chat request."""
+    if not knowledge_used:
+        return []
+    if not trace_id:
+        raise ValueError(f"chat for {case_id} turn {turn_index} used knowledge without a trace_id")
+    trace_response = client.get(f"/traces/{trace_id}")
+    trace_response.raise_for_status()
+    trace_payload = trace_response.json()
+    stages = trace_payload.get("stages", []) if isinstance(trace_payload, dict) else []
+    for stage in reversed(stages):
+        if not isinstance(stage, dict) or stage.get("name") != "knowledge_context.build":
+            continue
+        meta = stage.get("meta", {})
+        contexts = meta.get("retrieved_contexts", []) if isinstance(meta, dict) else []
+        if isinstance(contexts, list):
+            normalized = [str(context).strip() for context in contexts if str(context).strip()]
+            if normalized:
+                return normalized
+    raise ValueError(
+        f"chat for {case_id} turn {turn_index} used knowledge but its trace has no retrieved contexts"
+    )
+
+
 async def _score_record(
     record: Dict[str, Any],
     metrics: Dict[str, Any],
@@ -598,13 +642,17 @@ async def _score_record(
             response=response,
         ),
     }
-    reference_contexts = record.get("reference_contexts", [])
-    if record.get("chat", {}).get("knowledge_used") and reference_contexts:
+    retrieved_contexts = record.get("retrieved_contexts", [])
+    if (
+        record.get("chat", {}).get("knowledge_used")
+        and record.get("chat", {}).get("retrieved_context_source") == "chat_trace"
+        and retrieved_contexts
+    ):
         metric_tasks["faithfulness"] = score_metric(
             metrics["faithfulness"],
             user_input=user_input,
             response=response,
-            retrieved_contexts=reference_contexts,
+            retrieved_contexts=retrieved_contexts,
         )
     metric_names = list(metric_tasks)
     metric_results = await asyncio.gather(*(metric_tasks[name] for name in metric_names))
@@ -647,7 +695,22 @@ def evaluate_workflow_records(records: List[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def _write_report(path: Path, report: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_safe(report), ensure_ascii=False, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _parse_bool(value: Any, *, name: str) -> bool:

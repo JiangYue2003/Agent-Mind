@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import pathlib
 import sys
 import tempfile
@@ -65,6 +66,17 @@ class _FakeHttpClient:
         self.calls.append({"path": path, "params": params, "json": None})
         if path == "/knowledge/chunks":
             return _FakeResponse({"items": [{"title": "退款到账时间说明"}]})
+        if path == "/traces/trace-001":
+            return _FakeResponse({
+                "stages": [{
+                    "name": "knowledge_context.build",
+                    "meta": {
+                        "retrieved_contexts": [
+                            "1. 标题: 退款到账时间说明\n   命中片段: 审核通过后，银行卡退款通常在 1-3 个工作日内到账。"
+                        ],
+                    },
+                }],
+            })
         raise AssertionError(f"unexpected request: {path}")
 
 
@@ -118,11 +130,14 @@ class RagasRunnerTests(unittest.TestCase):
         }
         client = _FakeHttpClient()
 
-        records = collect_deployed_records([case], client=client, top_k=2)
+        records = collect_deployed_records([case], client=client, top_k=2, run_id="test-run")
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["user_input"], case["user_input"])
         self.assertEqual(records[0]["retrieved_contexts"], [
+            "1. 标题: 退款到账时间说明\n   命中片段: 审核通过后，银行卡退款通常在 1-3 个工作日内到账。",
+        ])
+        self.assertEqual(records[0]["diagnostic_retrieved_contexts"], [
             "审核通过后，银行卡退款通常在 1-3 个工作日内到账。",
             "退款成功后可查看支付账户明细。",
         ])
@@ -141,8 +156,13 @@ class RagasRunnerTests(unittest.TestCase):
             "json": {
                 "message": case["user_input"],
                 "user_id": "ragas-eval-refund-arrival-001",
-                "conv_id": "ragas-eval-refund-arrival-001",
+                "conv_id": "ragas-eval-test-run-refund-arrival-001",
             },
+        })
+        self.assertEqual(client.calls[2], {
+            "path": "/traces/trace-001",
+            "params": None,
+            "json": None,
         })
 
     def test_collect_deployed_records_preserves_workflow_turns_in_one_conversation(self):
@@ -171,7 +191,7 @@ class RagasRunnerTests(unittest.TestCase):
         }
 
         client = _FakeHttpClient()
-        records = collect_deployed_records([case], client=client, top_k=2)
+        records = collect_deployed_records([case], client=client, top_k=2, run_id="run-20260710")
 
         self.assertEqual([record["user_input"] for record in records], [
             "我想退款",
@@ -189,8 +209,8 @@ class RagasRunnerTests(unittest.TestCase):
         self.assertTrue(all(record["chat"]["knowledge_used"] for record in records))
         chat_calls = [call for call in client.calls if call["path"] == "/chat"]
         self.assertEqual([call["json"]["conv_id"] for call in chat_calls], [
-            "ragas-eval-refund-workflow-001",
-            "ragas-eval-refund-workflow-001",
+            "ragas-eval-run-20260710-refund-workflow-001",
+            "ragas-eval-run-20260710-refund-workflow-001",
         ])
 
     def test_collect_deployed_records_rejects_search_without_required_reranking(self):
@@ -223,6 +243,7 @@ class RagasRunnerTests(unittest.TestCase):
                 top_k=2,
                 require_rerank=True,
                 required_rerank_provider="tei",
+                run_id="test-run",
             )
 
     def test_build_ragas_samples_excludes_unanswerable_cases(self):
@@ -467,8 +488,8 @@ class RagasRunnerTests(unittest.TestCase):
             "retrieved_contexts": ["退款审核通过后会原路退回。"],
             "response": "通常会原路退回。",
             "reference": "审核通过后会原路退回。",
-            "reference_contexts": ["退款会原路退回。"],
-            "chat": {"knowledge_used": True},
+            "reference_contexts": ["评测金标上下文，不应传给 Faithfulness。"],
+            "chat": {"knowledge_used": True, "retrieved_context_source": "chat_trace"},
             "metadata": {"unanswerable": False, "evaluation_mode": "knowledge"},
         }, {
             "user_input": "我想退款",
@@ -500,8 +521,66 @@ class RagasRunnerTests(unittest.TestCase):
         self.assertEqual(faithfulness_calls, [{
             "user_input": "退款多久到账？",
             "response": "通常会原路退回。",
-            "retrieved_contexts": ["退款会原路退回。"],
+            "retrieved_contexts": ["退款审核通过后会原路退回。"],
         }])
+
+    def test_run_ragas_evaluation_skips_faithfulness_for_legacy_diagnostic_contexts(self):
+        class FakeResult:
+            def __init__(self, value):
+                self.value = value
+
+        calls = []
+
+        class FakeMetric:
+            def __init__(self, name):
+                self.name = name
+
+            async def ascore(self, **kwargs):
+                calls.append((self.name, kwargs))
+                return FakeResult(0.9)
+
+        metrics = {
+            "faithfulness": FakeMetric("faithfulness"),
+            "factual_correctness": FakeMetric("factual_correctness"),
+            "answer_relevancy": FakeMetric("answer_relevancy"),
+        }
+        records = [{
+            "user_input": "退款多久到账？",
+            "retrieved_contexts": ["这是旧报告的诊断检索结果。"],
+            "response": "通常会原路退回。",
+            "reference": "审核通过后会原路退回。",
+            "chat": {"knowledge_used": True},
+            "metadata": {"unanswerable": False, "evaluation_mode": "knowledge"},
+        }]
+
+        with mock.patch("evaluation.ragas_runner.build_collection_metrics", return_value=metrics):
+            rows = run_ragas_evaluation(records, evaluator_llm="judge", evaluator_embeddings="embeddings")
+
+        self.assertIsNone(rows[0]["faithfulness"])
+        self.assertNotIn("faithfulness", [name for name, _ in calls])
+
+    def test_write_report_replaces_non_finite_values_with_null(self):
+        report = {
+            "ragas_rows": [{
+                "faithfulness": math.nan,
+                "answer_relevancy": math.inf,
+                "factual_correctness": -math.inf,
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = pathlib.Path(temp_dir) / "report.json"
+            ragas_runner._write_report(path, report)
+            raw = path.read_text(encoding="utf-8")
+            saved = json.loads(raw)
+
+        self.assertNotIn("NaN", raw)
+        self.assertNotIn("Infinity", raw)
+        self.assertEqual(saved["ragas_rows"][0], {
+            "faithfulness": None,
+            "answer_relevancy": None,
+            "factual_correctness": None,
+        })
 
     def test_run_ragas_evaluation_bounds_metric_concurrency_and_keeps_row_order(self):
         class FakeResult:

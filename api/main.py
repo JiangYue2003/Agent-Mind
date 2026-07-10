@@ -56,6 +56,7 @@ _trace_store  = None
 _action_planner = None
 _slot_manager = None
 _state_machine = None
+_workflow_intent_decider = None
 _mock_handoff_records: List[Dict[str, Any]] = []
 _mock_refund_records: Dict[str, Dict[str, Any]] = {}
 
@@ -147,7 +148,7 @@ def _ensure_trace_store():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer, _trace_store
-    global _action_planner, _slot_manager, _state_machine
+    global _action_planner, _slot_manager, _state_machine, _workflow_intent_decider
 
     print(BANNER, flush=True)
 
@@ -164,6 +165,7 @@ async def lifespan(app: FastAPI):
     from monitor.performance_monitor import PerformanceMonitor
     from telemetry.runtime import TraceStore
     from workflow.action_planner import ActionPlanner
+    from workflow.intent_decider import WorkflowIntentDecider
     from workflow.slot_manager import SlotManager
     from workflow.state_machine import WorkflowStateMachine
 
@@ -177,6 +179,11 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
     )
     _chat_intent_recognizer = recognizer
+    _workflow_intent_decider = WorkflowIntentDecider(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+    )
     _trace_store = TraceStore(capacity=int(os.getenv("TRACE_STORE_CAPACITY", "200")))
     _slot_manager = SlotManager()
     _action_planner = ActionPlanner(slot_manager=_slot_manager)
@@ -420,11 +427,27 @@ async def chat(req: ChatRequest):
             with trace.stage("intent.recognize"):
                 intent_result = await _recognize_chat_intent(req.message, history)
 
+            workflow_decision = None
+            if not _should_handoff(req.message, intent_result):
+                with trace.stage("workflow.decide"):
+                    workflow_decision = await _decide_workflow(
+                        req.message,
+                        intent_result,
+                        history,
+                    )
+                    if workflow_decision is not None:
+                        trace._stages[-1].meta["decision"] = workflow_decision.to_dict()
+
+            entities = _entities_with_resolved_order_id(intent_result, workflow_decision)
+            if intent_result is not None and entities is not getattr(intent_result, "entities", None):
+                intent_result.entities = entities
+
             with trace.stage("workflow.slot_check"):
                 slot_assessment = _get_slot_manager().assess(
                     message=req.message,
                     intent=intent_result.intent if intent_result else None,
-                    entities=getattr(intent_result, "entities", {}) if intent_result else {},
+                    entities=entities,
+                    decision=workflow_decision,
                 )
                 trace._stages[-1].meta["slot_check"] = slot_assessment.to_dict()
 
@@ -432,10 +455,11 @@ async def chat(req: ChatRequest):
                 action_plan = _get_action_planner().plan(
                     message=req.message,
                     intent=intent_result.intent if intent_result else None,
-                    entities=getattr(intent_result, "entities", {}) if intent_result else {},
+                    entities=entities,
                     slot_assessment=slot_assessment,
                     intent_confidence=getattr(intent_result, "confidence", 0.0) if intent_result else 0.0,
                     intent_reasoning=getattr(intent_result, "reasoning", "") if intent_result else "",
+                    decision=workflow_decision,
                 )
                 trace._stages[-1].meta["plan"] = action_plan.to_dict()
 
@@ -450,7 +474,7 @@ async def chat(req: ChatRequest):
             if workflow_path.includes(WorkflowState.CLARIFY):
                 response_text = action_plan.clarify_prompt or slot_assessment.clarify_question or "为了继续帮你处理，请补充关键信息。"
             else:
-                context_parts = [mem_ctx.to_prompt_text()]
+                context_parts = [_final_answer_memory_context(mem_ctx)]
                 execution_result = await _execute_workflow_plan(
                     action_plan,
                     req,
@@ -479,6 +503,8 @@ async def chat(req: ChatRequest):
                 with trace.stage("orchestrator.run"):
                     result = await _run_planned_orchestrator(orch_req, action_plan, trace=trace)
                 response_text = result.response
+                if action_plan.follow_up_prompt:
+                    response_text = f"{response_text.rstrip()}\n\n{action_plan.follow_up_prompt}"
                 if not action_plan.need_handoff:
                     response_agent_type = result.agent_type
                 response_intent = result.intent
@@ -517,7 +543,7 @@ async def chat(req: ChatRequest):
 
 async def _build_knowledge_context(
     message: str,
-    top_k: int = 3,
+    top_k: Optional[int] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> tuple[str, bool]:
     """
@@ -529,14 +555,21 @@ async def _build_knowledge_context(
         return "", False
     if not _should_use_knowledge(message):
         return "", False
+    resolved_top_k = _answer_knowledge_top_k() if top_k is None else top_k
     try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k, context=context)
+        result = await _tool_manager.search_with_rewrite(
+            "knowledge_search",
+            message,
+            top_k=resolved_top_k,
+            context=context,
+        )
         if not result.success or not isinstance(result.data, list) or not result.data:
             return "", False
 
         parts = ["[知识库检索结果]"]
         used = False
-        for i, item in enumerate(result.data[:top_k], start=1):
+        prompt_blocks = []
+        for i, item in enumerate(result.data[:resolved_top_k], start=1):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "未命名文档"))
@@ -555,15 +588,47 @@ async def _build_knowledge_context(
             block.append(f"   命中片段: {content[:320]}")
             if parent_content and parent_content != content:
                 block.append(f"   所属段落: {parent_content[:420]}")
-            parts.append("\n".join(block))
+            prompt_block = "\n".join(block)
+            prompt_blocks.append(prompt_block)
+            parts.append(prompt_block)
 
         if not used:
             return "", False
-        parts.append("请优先依据以上知识库内容回答；如果知识库内容不足，再结合通用客服能力说明。")
+        trace = (context or {}).get("trace")
+        if trace is not None:
+            for stage in reversed(trace._stages):
+                if stage.name == "knowledge_context.build":
+                    stage.meta["retrieved_contexts"] = prompt_blocks
+                    break
+        parts.append("请仅依据以上知识库内容回答；若信息不足，请明确说明知识库未提供该信息。")
         return "\n".join(parts), True
     except Exception as ex:
         logger.warning(f"构建知识库上下文失败: {ex}")
         return "", False
+
+
+def _answer_knowledge_top_k() -> int:
+    value = os.getenv("RAG_ANSWER_TOP_K", "5")
+    try:
+        top_k = int(value)
+    except ValueError:
+        logger.warning("RAG_ANSWER_TOP_K=%r 无效，使用默认值 5", value)
+        return 5
+    if top_k < 1:
+        logger.warning("RAG_ANSWER_TOP_K=%r 必须为正数，使用默认值 5", value)
+        return 5
+    return top_k
+
+
+def _final_answer_memory_context(mem_ctx: Any) -> str:
+    """Keep cross-conversation memory out of answer prompts that may state live facts."""
+    renderer = getattr(mem_ctx, "to_prompt_text", None)
+    if renderer is None:
+        return ""
+    try:
+        return renderer(include_cross_conversation=False)
+    except TypeError:
+        return renderer()
 
 
 async def _recognize_chat_intent(message: str, history: Optional[List[Dict[str, str]]]):
@@ -577,6 +642,35 @@ async def _recognize_chat_intent(message: str, history: Optional[List[Dict[str, 
     except Exception as ex:
         logger.warning(f"chat 意图识别失败: {ex}")
         return None
+
+
+async def _decide_workflow(message: str, intent_result: Any, history: Optional[List[Dict[str, str]]]):
+    decider = _workflow_intent_decider
+    if decider is None:
+        return None
+    try:
+        return await decider.decide(
+            message=message,
+            intent=getattr(intent_result, "intent", None),
+            entities=getattr(intent_result, "entities", {}) if intent_result else {},
+            history=history,
+        )
+    except Exception as ex:
+        logger.warning(f"workflow 语义决策失败: {ex}")
+        return None
+
+
+def _entities_with_resolved_order_id(intent_result: Any, decision: Any) -> Dict[str, List[str]]:
+    entities = dict(getattr(intent_result, "entities", {}) or {}) if intent_result else {}
+    order_ids = entities.get("order_id") or []
+    if not isinstance(order_ids, list):
+        order_ids = [order_ids]
+    resolved_order_id = str(getattr(decision, "order_id", "") or "").strip()
+    if resolved_order_id:
+        entities["order_id"] = [resolved_order_id]
+    else:
+        entities["order_id"] = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
+    return entities
 
 
 async def _execute_workflow_plan(
