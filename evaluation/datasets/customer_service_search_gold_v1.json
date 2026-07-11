@@ -1,0 +1,252 @@
+{
+  "version": 1,
+  "knowledge_base": "customer-service-kb-current",
+  "selection_rule": "one source-file child chunk uniquely containing each retrieval case evidence_text; content hashes must match deployed chunks",
+  "case_gold_chunk_keys": {
+    "search-login-001": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:0"
+    ],
+    "search-login-002": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:1"
+    ],
+    "search-login-003": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:1"
+    ],
+    "search-login-004": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:2"
+    ],
+    "search-login-005": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:2"
+    ],
+    "search-login-006": [
+      "947d2b8b6813e7919ae555027b380b14:parent:0:2"
+    ],
+    "search-order-001": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:1"
+    ],
+    "search-order-002": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:1"
+    ],
+    "search-order-003": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:1"
+    ],
+    "search-order-004": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:3"
+    ],
+    "search-order-005": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:3"
+    ],
+    "search-order-006": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:3"
+    ],
+    "search-delivery-001": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:1"
+    ],
+    "search-delivery-002": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:1"
+    ],
+    "search-delivery-003": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:1"
+    ],
+    "search-delivery-004": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:2"
+    ],
+    "search-delivery-005": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:2"
+    ],
+    "search-delivery-006": [
+      "3f8691011103bcc77adc9353ad35b421:parent:1:1"
+    ],
+    "search-invoice-001": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:0"
+    ],
+    "search-invoice-002": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:1"
+    ],
+    "search-invoice-003": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:1"
+    ],
+    "search-invoice-004": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:2"
+    ],
+    "search-invoice-005": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:2"
+    ],
+    "search-invoice-006": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:1:0"
+    ],
+    "search-points-001": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:0:0"
+    ],
+    "search-points-002": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:0:1"
+    ],
+    "search-points-003": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:0:1"
+    ],
+    "search-points-004": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:0:2"
+    ],
+    "search-points-005": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:0:2"
+    ],
+    "search-points-006": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:1:0"
+    ],
+    "search-code-001": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:0:1"
+    ],
+    "search-code-002": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:0:1"
+    ],
+    "search-code-003": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:0:1"
+    ],
+    "search-code-004": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:0:2"
+    ],
+    "search-code-005": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:1:0"
+    ],
+    "search-code-006": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:1:0"
+    ],
+    "search-address-001": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:1"
+    ],
+    "search-address-002": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:1"
+    ],
+    "search-address-003": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:1"
+    ],
+    "search-address-004": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:2"
+    ],
+    "search-address-005": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:2"
+    ],
+    "search-address-006": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:2"
+    ],
+    "search-refund-apply-001": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:0"
+    ],
+    "search-refund-apply-002": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:1"
+    ],
+    "search-refund-apply-003": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:1"
+    ],
+    "search-refund-apply-004": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:2"
+    ],
+    "search-refund-apply-005": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:2"
+    ],
+    "search-refund-apply-006": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:1:1"
+    ],
+    "search-refund-arrival-001": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:0"
+    ],
+    "search-refund-arrival-002": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:1"
+    ],
+    "search-refund-arrival-003": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:1"
+    ],
+    "search-refund-arrival-004": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:1"
+    ],
+    "search-refund-arrival-005": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:2"
+    ],
+    "search-refund-arrival-006": [
+      "a48b9e42d31f1feab91766a1578294de:parent:0:2"
+    ],
+    "search-payment-001": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:0"
+    ],
+    "search-payment-002": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:1"
+    ],
+    "search-payment-003": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:1"
+    ],
+    "search-payment-004": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:2"
+    ],
+    "search-payment-005": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:2"
+    ],
+    "search-payment-006": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:1:1"
+    ],
+    "search-cross-001": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:2"
+    ],
+    "search-cross-002": [
+      "c000b58bec764c29b157e9608f29bbff:parent:0:1"
+    ],
+    "search-cross-003": [
+      "3f8691011103bcc77adc9353ad35b421:parent:0:2"
+    ],
+    "search-cross-004": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:0:0"
+    ],
+    "search-cross-005": [
+      "cb88e590ecaa47ad09b741f25a6db052:parent:1:0"
+    ],
+    "search-cross-006": [
+      "1e329703c7c892815c9b3b18d0df0356:parent:0:0"
+    ],
+    "search-cross-007": [
+      "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:2"
+    ],
+    "search-cross-008": [
+      "46a6d04a275473ef8aca6cb72e499b33:parent:1:0"
+    ],
+    "search-cross-009": [
+      "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:0"
+    ],
+    "search-cross-010": [
+      "e89a46ceeb042774ca43e4793e20cfbb:parent:0:1"
+    ]
+  },
+  "chunk_content_sha256": {
+    "1e329703c7c892815c9b3b18d0df0356:parent:0:0": "efd648b5d57eeb130776c50968e18e8cfc310f82a30bf9d1d6ebc5190fff7a71",
+    "1e329703c7c892815c9b3b18d0df0356:parent:0:1": "aed32d88056517195d2101f33071003d08dc8233123a7ff756a4c89c38e1988a",
+    "1e329703c7c892815c9b3b18d0df0356:parent:0:2": "9747538cb6e191af0146388081b2a16d88ea170170b7187c9478a9258d175f20",
+    "1e329703c7c892815c9b3b18d0df0356:parent:1:0": "1c21635c0dcc399878d759a5322d23666b46089891898b6a6c8dc6fe344997fe",
+    "3f8691011103bcc77adc9353ad35b421:parent:0:1": "ac5f23926b026362a95d497658750899563f155192c00e6ae567274b3229ec9f",
+    "3f8691011103bcc77adc9353ad35b421:parent:0:2": "b3f8fd03888ace6654690cb9e1bf15e983c780a4ddd4c4fa73a5ca5f9283b772",
+    "3f8691011103bcc77adc9353ad35b421:parent:1:1": "41f9e723d08970f84991eee6f0dcb3e1ce1a214a8c4f616ab815f600f7946961",
+    "46a6d04a275473ef8aca6cb72e499b33:parent:0:0": "2cbaed9ed8f8eea4acf0ea7ded9547811f12b6f7bd068dd21f7022021f95311f",
+    "46a6d04a275473ef8aca6cb72e499b33:parent:0:1": "1997986d4b92ca507b2bad3a67df7430bb3363da30346e3ce1995709a2f88ba6",
+    "46a6d04a275473ef8aca6cb72e499b33:parent:0:2": "929d50f391521215b1f69db2c0961be630ab415024971056bb05361bf681d491",
+    "46a6d04a275473ef8aca6cb72e499b33:parent:1:0": "5edde23f4f54be4fdf38b634373d3dc66378c052d23ddcecff0dd9e1f66c884c",
+    "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:1": "059e09b87a177c4d898d5ac641b2989c3cdb7afe9812ffd56de5df1cb447a768",
+    "8fd139ef195e6e9d7bb1b5248d0f5c27:parent:0:2": "862af766f29faaf84cccc5712e7fdbf6e10ff3720a29c1fd3a72aadc56414815",
+    "947d2b8b6813e7919ae555027b380b14:parent:0:0": "cba05bbdb233ac6c076df1fa4583029cc29a4d2dfa19b00db91ac7f335801cfd",
+    "947d2b8b6813e7919ae555027b380b14:parent:0:1": "ae45892c6f6687ae8eb498d32f94d92a18414f53e580e9dd0f71d3024a267bfa",
+    "947d2b8b6813e7919ae555027b380b14:parent:0:2": "5407dec1821cfafa8dbae53ccb528d8ec31acf8242ba92ef4515ae7478862018",
+    "a48b9e42d31f1feab91766a1578294de:parent:0:0": "e7d5a456d03c6838e9c238429db2e6475a656826c5653f2bcd04cac15a4327af",
+    "a48b9e42d31f1feab91766a1578294de:parent:0:1": "5ccc757fead84589887cfcd443ac4f8526079723bc3b21f64ed58ff31546a222",
+    "a48b9e42d31f1feab91766a1578294de:parent:0:2": "7f16ed032676c6ee800f7ee89634018d178791380992898084ce46fe47bdd18f",
+    "c000b58bec764c29b157e9608f29bbff:parent:0:1": "9e2f7e7ebcf5f111c1d316a3c091c484e2f3c072bef646c6dbbaf25a835b6cf6",
+    "c000b58bec764c29b157e9608f29bbff:parent:0:3": "c793ad296c3c216337ab50b6451a26fddc9daaa906d55276e3cb302c31290a28",
+    "cb88e590ecaa47ad09b741f25a6db052:parent:0:0": "65727d59eb294bdf022d3480c88273991c2f93b946ba93aa2fcc009f039426a2",
+    "cb88e590ecaa47ad09b741f25a6db052:parent:0:1": "c3f21c7d1faaf097b36b95cd3426f67c43e040f027bbb946d11e61482ab77272",
+    "cb88e590ecaa47ad09b741f25a6db052:parent:0:2": "10f951b70a7a22181c0e9010814bd458d52fe874b18b48c56a4ea66732b17921",
+    "cb88e590ecaa47ad09b741f25a6db052:parent:1:0": "94ffc0e7ef4ae3c09f2ad8282ee75bdabe004217681299aa884888d0df244673",
+    "e89a46ceeb042774ca43e4793e20cfbb:parent:0:0": "d4533ff19e2dc0d1715b65a640c830646cfcc332bc62848c707b9eff42bc46d7",
+    "e89a46ceeb042774ca43e4793e20cfbb:parent:0:1": "04149ab6d0cd6a25680986b211db4c255fcab8795ad19311f3490b39b58b8245",
+    "e89a46ceeb042774ca43e4793e20cfbb:parent:0:2": "f9c55bd34b5bc7c34958c35077cfa505668fdae241a0c33f488a7c12f5db89c2",
+    "e89a46ceeb042774ca43e4793e20cfbb:parent:1:1": "29f2f4cf7ee6fbdb57b3aeb76151aee742e29e403ea7e0991e218c2dfcae8f62",
+    "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:0": "e04d0716b0e476c14cca476ddb6edb45ed30d1db762779c213f439c12acae0c2",
+    "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:1": "5a2e536eecd4ead64a7e4ab8b28dffb36a82b70bcf80bb379a6bdfa8a3b34b03",
+    "ece6a5c67742e4d5fd7ae821a8cf575d:parent:0:2": "6a2ed72323b5a53b7151bf52eb1ae9d15044f9880af60e7bca380589953bc986",
+    "ece6a5c67742e4d5fd7ae821a8cf575d:parent:1:1": "e130be173c6df611375c12a1e99fd52e9aa592b77ae0322e6b2d9dc712970cf7"
+  }
+}
