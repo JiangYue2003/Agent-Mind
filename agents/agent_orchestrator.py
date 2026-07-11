@@ -155,11 +155,12 @@ class BaseAgent:
         messages.append({"role": "user", "content": _clean(req.message)})
 
         trace = (context or {}).get("trace")
+        system_prompt = self._system_prompt_for(context)
         if trace is None:
             resp = await self._client.messages.create(
                 model=self._model,
                 max_tokens=450,
-                system=self.system_prompt,
+                system=system_prompt,
                 messages=messages,
             )
         else:
@@ -167,13 +168,23 @@ class BaseAgent:
                 resp = await self._client.messages.create(
                     model=self._model,
                     max_tokens=450,
-                    system=self.system_prompt,
+                    system=system_prompt,
                     messages=messages,
                 )
                 usage = _extract_usage_dict(resp)
                 if usage:
                     trace._stages[-1].meta["usage"] = usage
         return resp.content[0].text
+
+    def _system_prompt_for(self, context: Optional[Dict[str, Any]]) -> str:
+        skills = (context or {}).get("agent_skills", [])
+        blocks: List[str] = []
+        for skill in skills:
+            skill_id = str(skill.get("id", "") or "").strip() if isinstance(skill, dict) else ""
+            prompt = str(skill.get("prompt", "") or "").strip() if isinstance(skill, dict) else ""
+            if skill_id and prompt:
+                blocks.append(f"[Skill: {skill_id}]\n{prompt}")
+        return self.system_prompt if not blocks else f"{self.system_prompt}\n\n" + "\n\n".join(blocks)
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级（简单关键词检测）。"""
@@ -410,7 +421,7 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req, context=context)
+        response = await agent.handle(req, context=self._context_for_agent(context, agent_type))
 
         # 专属 Agent 失败时降级到 GeneralAgent
         fallback = None
@@ -418,9 +429,22 @@ class AgentOrchestrator:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
         if fallback:
-            response = await fallback.handle(req, context=context)
+            response = await fallback.handle(req, context=self._context_for_agent(context, AgentType.GENERAL))
 
         return response
+
+    @staticmethod
+    def _context_for_agent(
+        context: Optional[Dict[str, Any]],
+        agent_type: AgentType,
+    ) -> Optional[Dict[str, Any]]:
+        if context is None:
+            return None
+        scoped_context = dict(context)
+        skills_by_role = scoped_context.pop("agent_skills_by_role", None)
+        if isinstance(skills_by_role, dict):
+            scoped_context["agent_skills"] = list(skills_by_role.get(agent_type.value, []))
+        return scoped_context
 
     def get_stats(self) -> Dict[str, Any]:
         result = {}

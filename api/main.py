@@ -23,7 +23,7 @@ if _ROOT not in sys.path:
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
@@ -57,6 +57,9 @@ _action_planner = None
 _slot_manager = None
 _state_machine = None
 _workflow_intent_decider = None
+_skill_runtime = None
+_skill_store = None
+_skill_reload_task = None
 _mock_handoff_records: List[Dict[str, Any]] = []
 _mock_refund_records: Dict[str, Dict[str, Any]] = {}
 
@@ -145,10 +148,41 @@ def _ensure_trace_store():
     return _trace_store
 
 
+def _skill_review_required() -> bool:
+    configured = os.getenv("SKILL_REVIEW_REQUIRED", "").strip().lower()
+    if configured:
+        return configured in {"1", "true", "yes", "on"}
+    return os.getenv("APP_ENV", "production").strip().lower() != "development"
+
+
+def _create_skill_runtime(tool_manager: Any):
+    from skills.runtime import SkillRuntime
+
+    skill_catalog_dir = pathlib.Path(os.getenv("SKILL_CATALOG_DIR", str(pathlib.Path(_ROOT) / "skills" / "catalog")))
+    skill_data_dir = pathlib.Path(os.getenv("SKILL_DATA_DIR", str(pathlib.Path(_ROOT) / "data" / "skills")))
+    return SkillRuntime(
+        catalog_dir=skill_catalog_dir,
+        published_dir=skill_data_dir / "published",
+        drafts_dir=skill_data_dir / "drafts",
+        known_tools=tool_manager._tools.keys(),
+    )
+
+
+async def _watch_skill_catalog(runtime: Any, interval_s: float) -> None:
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            if runtime.refresh_if_changed():
+                logger.info("Skill 目录已热加载到 generation=%s", runtime.snapshot.generation)
+        except Exception as ex:
+            logger.warning("Skill 目录热加载失败: %s", ex)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _chat_intent_recognizer, _trace_store
     global _action_planner, _slot_manager, _state_machine, _workflow_intent_decider
+    global _skill_runtime, _skill_store, _skill_reload_task
 
     print(BANNER, flush=True)
 
@@ -163,6 +197,7 @@ async def lifespan(app: FastAPI):
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
+    from skills.runtime import SkillRuntime, SkillStore
     from telemetry.runtime import TraceStore
     from workflow.action_planner import ActionPlanner
     from workflow.intent_decider import WorkflowIntentDecider
@@ -293,6 +328,7 @@ async def lifespan(app: FastAPI):
             "required": ["user_id", "order_id"],
         },
     ))
+
     _tool_manager.register(Tool(
         name="human_handoff",
         description="转人工并写入会话上下文到外部客服系统",
@@ -315,6 +351,12 @@ async def lifespan(app: FastAPI):
             "required": ["user_id", "conv_id", "latest_message"],
         },
     ))
+
+    _skill_runtime = _create_skill_runtime(_tool_manager)
+    _skill_runtime.refresh()
+    _skill_store = SkillStore(runtime=_skill_runtime, review_required=_skill_review_required())
+    reload_interval_s = max(0.1, float(os.getenv("SKILL_RELOAD_INTERVAL_SECONDS", "1")))
+    _skill_reload_task = asyncio.create_task(_watch_skill_catalog(_skill_runtime, reload_interval_s))
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -340,6 +382,13 @@ async def lifespan(app: FastAPI):
     logger.info("EchoMind 已就绪")
     yield
 
+    if _skill_reload_task is not None:
+        _skill_reload_task.cancel()
+        try:
+            await _skill_reload_task
+        except asyncio.CancelledError:
+            pass
+        _skill_reload_task = None
     await _monitor.stop()
     logger.info("EchoMind 已关闭")
 
@@ -378,6 +427,84 @@ class ChatResponse(BaseModel):
     trace_id:    str = ""
 
 
+def _require_skill_admin(token: Optional[str]) -> None:
+    expected = os.getenv("SKILL_ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(503, "Skill 管理接口未配置")
+    if token != expected:
+        raise HTTPException(403, "Skill 管理权限不足")
+
+
+@app.post("/admin/skills/upload", status_code=201, tags=["Skills"])
+async def upload_skill(
+    file: UploadFile = File(...),
+    x_skill_admin_token: Optional[str] = Header(default=None),
+):
+    _require_skill_admin(x_skill_admin_token)
+    if _skill_store is None or _skill_runtime is None:
+        raise HTTPException(503, "Skill 运行时未初始化")
+    if not (file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(400, "Skill 上传文件必须是 ZIP")
+
+    from skills.runtime import SkillValidationError
+
+    try:
+        result = _skill_store.upload_zip(await file.read())
+    except SkillValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "draft_id": result.draft_id,
+        "status": result.status,
+        "auto_published": result.auto_published,
+        "skill": {
+            "id": result.skill.id,
+            "version": result.skill.version,
+        },
+        "generation": _skill_runtime.snapshot.generation,
+    }
+
+
+@app.post("/admin/skills/{draft_id}/publish", tags=["Skills"])
+async def publish_skill(
+    draft_id: str,
+    x_skill_admin_token: Optional[str] = Header(default=None),
+):
+    _require_skill_admin(x_skill_admin_token)
+    if _skill_store is None or _skill_runtime is None:
+        raise HTTPException(503, "Skill 运行时未初始化")
+
+    from skills.runtime import SkillValidationError
+
+    try:
+        skill = _skill_store.publish(draft_id)
+    except SkillValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {
+        "status": "published",
+        "skill": {"id": skill.id, "version": skill.version},
+        "generation": _skill_runtime.snapshot.generation,
+    }
+
+
+@app.get("/admin/skills", tags=["Skills"])
+async def skill_catalog(x_skill_admin_token: Optional[str] = Header(default=None)):
+    _require_skill_admin(x_skill_admin_token)
+    if _skill_store is None or _skill_runtime is None:
+        raise HTTPException(503, "Skill 运行时未初始化")
+    payload = _skill_runtime.describe()
+    payload["drafts"] = _skill_store.list_drafts()
+    return payload
+
+
+@app.post("/admin/skills/reload", tags=["Skills"])
+async def reload_skills(x_skill_admin_token: Optional[str] = Header(default=None)):
+    _require_skill_admin(x_skill_admin_token)
+    if _skill_runtime is None:
+        raise HTTPException(503, "Skill 运行时未初始化")
+    _skill_runtime.refresh()
+    return _skill_runtime.describe()
+
+
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -410,6 +537,7 @@ async def chat(req: ChatRequest):
     response_escalated = False
     knowledge_used = False
     response_latency_ms = 0.0
+    skill_snapshot = _skill_runtime.snapshot if _skill_runtime is not None else None
     t0 = time.monotonic()
 
     try:
@@ -501,7 +629,12 @@ async def chat(req: ChatRequest):
 
                 # 3. 执行
                 with trace.stage("orchestrator.run"):
-                    result = await _run_planned_orchestrator(orch_req, action_plan, trace=trace)
+                    result = await _run_planned_orchestrator(
+                        orch_req,
+                        action_plan,
+                        trace=trace,
+                        skill_snapshot=skill_snapshot,
+                    )
                 response_text = result.response
                 if action_plan.follow_up_prompt:
                     response_text = f"{response_text.rstrip()}\n\n{action_plan.follow_up_prompt}"
@@ -828,24 +961,42 @@ def _build_workflow_tool_registry():
     return registry
 
 
-async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None):
+async def _run_planned_orchestrator(
+    orch_req: Any,
+    plan: Any,
+    trace: Any = None,
+    skill_snapshot: Any = None,
+):
     from agents.agent_orchestrator import OrchestratorResult, Request as OrcReq
 
     route_plan = getattr(plan, "route_plan", None)
+    skills_by_role = _build_agent_skills_context(skill_snapshot, plan, orch_req.intent)
+    if trace is not None and trace._stages:
+        trace._stages[-1].meta["skill_snapshot_generation"] = getattr(skill_snapshot, "generation", 0)
+        trace._stages[-1].meta["skill_ids_by_role"] = {
+            role: [str(skill.get("id", "")) for skill in skills]
+            for role, skills in skills_by_role.items()
+        }
+    execution_context: Dict[str, Any] = {}
+    if trace is not None:
+        execution_context["trace"] = trace
+    if skills_by_role:
+        execution_context["agent_skills_by_role"] = skills_by_role
+    context = execution_context or None
     if _orchestrator is None or route_plan is None:
-        return await _orchestrator.run(orch_req, context={"trace": trace} if trace is not None else None)
+        return await _orchestrator.run(orch_req, context=context)
 
     if not getattr(route_plan, "supporting_agents", []):
         primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
         overall_t0 = time.monotonic()
         if trace is None:
-            primary_response = await _orchestrator._execute(orch_req, primary_agent_type, context=None)
+            primary_response = await _orchestrator._execute(orch_req, primary_agent_type, context=context)
         else:
             with trace.stage("orchestrator.execute", agent_type=primary_agent_type.value):
                 primary_response = await _orchestrator._execute(
                     orch_req,
                     primary_agent_type,
-                    context={"trace": trace},
+                    context=context,
                 )
 
         escalated = bool(getattr(primary_response, "escalate", False))
@@ -862,7 +1013,7 @@ async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None)
     supporting_agent_types = [_agent_type_from_role(agent) for agent in route_plan.supporting_agents]
     if getattr(route_plan, "merge_mode", None) and getattr(route_plan.merge_mode, "value", "") == "parallel_sections":
         agent_types = [_agent_type_from_role(route_plan.primary_agent)] + supporting_agent_types
-        return await _orchestrator.run_parallel(orch_req, agent_types, context={"trace": trace} if trace is not None else None)
+        return await _orchestrator.run_parallel(orch_req, agent_types, context=context)
 
     primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
     support_blocks = []
@@ -870,7 +1021,7 @@ async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None)
     if trace is None:
         support_results = await asyncio.gather(
             *[
-                _orchestrator._execute(_build_supporting_agent_request(orch_req, agent_type), agent_type, context=None)
+                _orchestrator._execute(_build_supporting_agent_request(orch_req, agent_type), agent_type, context=context)
                 for agent_type in supporting_agent_types
             ],
             return_exceptions=True,
@@ -882,7 +1033,7 @@ async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None)
                     _orchestrator._execute(
                         _build_supporting_agent_request(orch_req, agent_type),
                         agent_type,
-                        context={"trace": trace},
+                        context=context,
                     )
                     for agent_type in supporting_agent_types
                 ],
@@ -910,10 +1061,10 @@ async def _run_planned_orchestrator(orch_req: Any, plan: Any, trace: Any = None)
     )
 
     if trace is None:
-        primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context=None)
+        primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context=context)
     else:
         with trace.stage("orchestrator.primary_summarize", primary_agent=primary_agent_type.value):
-            primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context={"trace": trace})
+            primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context=context)
 
     escalated = escalated or bool(getattr(primary_response, "escalate", False))
     return OrchestratorResult(
@@ -1316,6 +1467,46 @@ def _agent_type_for_intent(intent: Any, action_plan: Any):
     if intent in {IntentCategory.BILLING, IntentCategory.ACCOUNT}:
         return AgentType.BILLING
     return AgentType.GENERAL
+
+
+def _build_agent_skills_context(snapshot: Any, action_plan: Any, intent: Any) -> Dict[str, List[Dict[str, Any]]]:
+    if _skill_runtime is None or snapshot is None:
+        return {}
+    route_plan = getattr(action_plan, "route_plan", None)
+    if route_plan is None:
+        return {}
+
+    roles = [getattr(route_plan.primary_agent, "value", str(route_plan.primary_agent))]
+    roles.extend(getattr(agent, "value", str(agent)) for agent in getattr(route_plan, "supporting_agents", []))
+    final_writer = getattr(route_plan, "final_writer", None)
+    if final_writer is not None:
+        roles.append(getattr(final_writer, "value", str(final_writer)))
+    planned_tools = [
+        str(getattr(action, "tool_name", "") or "")
+        for action in getattr(action_plan, "actions", [])
+        if getattr(action, "tool_name", "")
+    ]
+    intent_category = getattr(intent, "value", "other")
+    goal = str(getattr(action_plan, "primary_goal", "") or "")
+    context: Dict[str, List[Dict[str, Any]]] = {}
+    for role in dict.fromkeys(roles):
+        skills = _skill_runtime.select_from_snapshot(
+            snapshot,
+            agent_role=role,
+            intent_category=intent_category,
+            goal=goal,
+            planned_tools=planned_tools,
+        )
+        context[role] = [
+            {
+                "id": skill.id,
+                "version": skill.version,
+                "prompt": skill.prompt,
+                "allowed_tools": list(skill.allowed_tools),
+            }
+            for skill in skills
+        ]
+    return context
 
 
 def _agent_type_from_role(role: Any):

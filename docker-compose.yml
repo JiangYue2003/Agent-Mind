@@ -124,7 +124,9 @@ services:
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - ./data/skills:/app/data/skills
       - ./logs:/app/logs
+      - ./skills/catalog:/app/skills/catalog:ro
     depends_on:
       redis:
         condition: service_healthy

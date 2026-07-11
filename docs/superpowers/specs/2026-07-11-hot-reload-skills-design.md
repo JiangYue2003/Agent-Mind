@@ -15,9 +15,9 @@ The feature extends the current `/chat` path instead of replacing it:
 ```
 
 `MCPToolManager` remains the only execution boundary for business tools. A
-Skill grants a subset of already registered tool names; it does not register a
-new handler or bypass the tool schema, timeout, circuit breaker, or workflow
-slot checks.
+Skill may bind itself to already registered tool names for activation and
+validation; it does not register a new handler or bypass the tool schema,
+timeout, circuit breaker, or workflow slot checks.
 
 ## Package Contract
 
@@ -33,15 +33,17 @@ prompt.md
 
 - `id`, `name`, and semantic `version`;
 - `description` for diagnostics and catalog display;
-- `targets.agent_roles`, `targets.intent_categories`, and
-  `targets.goals` for deterministic activation;
-- `allowed_tools`, constrained to the active MCP tool catalog;
+- `targets.agent_roles`, `targets.intent_categories`, `targets.goals`, and
+  optional `targets.tools` for deterministic activation;
+- `allowed_tools`, constrained to the active MCP tool catalog and the current
+  planned tool set before activation;
 - `prompt_file`, `priority`, and bounded response/tool constraints.
 
 `prompt.md` contains the instruction fragment appended to the selected child
 Agent's base system prompt. The runtime treats it as data, not source code.
-Skill IDs, archive paths, file sizes, JSON shape, duplicate versions, tool
-bindings, and prompt size are validated before a package can become active.
+Skill IDs, archive paths, file sizes, JSON shape, duplicate versions across
+sources, tool bindings, and prompt size are validated before a package can
+become active.
 
 ## Sources And Lifecycle
 
@@ -59,6 +61,12 @@ snapshot before selection, so a reload cannot change the Skill set halfway
 through a response. A refresh builds a complete replacement snapshot and
 swaps it only after all packages validate. If a new package is invalid, the
 last valid snapshot stays active and the failure is observable.
+
+The loader compares source fingerprints before and after parsing and retries a
+short bounded number of times when a package is being edited. A publication is
+successful only when its version appears in the replacement snapshot; otherwise
+the newly copied published directory is removed and the validated draft remains
+available for a later retry.
 
 `SkillRuntime` runs a lightweight polling task in FastAPI lifespan. It compares
 the sources' file fingerprints at a short configurable interval, refreshes on
@@ -79,9 +87,9 @@ After the existing workflow plan chooses the primary/supporting Agent roles,
 The selection is declarative and uses no new customer-service keyword rules.
 The resulting instructions and allowed tool names are passed in the existing
 orchestrator context. `BaseAgent` composes them with its fixed base system
-prompt for that invocation. Supporting Agents receive only Skills targeted at
-their own role. The static Agent pool, bounded workflow, evidence flow, and
-MCP executor remain intact.
+prompt for that invocation. Primary, supporting, and distinct final-writer
+Agents receive only Skills targeted at their own role. The static Agent pool,
+bounded workflow, evidence flow, and MCP executor remain intact.
 
 ## Upload, Review, And Development Mode
 
