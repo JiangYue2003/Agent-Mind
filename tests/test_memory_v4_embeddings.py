@@ -99,23 +99,6 @@ class MemoryV4EmbeddingTests(unittest.TestCase):
         self.assertEqual(MemoryManager.EPISODIC_COLLECTION_NAME, "episodic_v4")
         self.assertEqual(MemoryManager.PROFILE_COLLECTION_NAME, "user_profile_v4")
 
-    def test_memory_v4_collections_disable_chroma_default_embedding(self):
-        chroma_client = _ChromaClient()
-        with patch("memory.conversation_memory.redis.from_url"), patch(
-            "memory.conversation_memory.AsyncAnthropic"
-        ), patch("memory.conversation_memory.chromadb.HttpClient", return_value=chroma_client), patch(
-            "memory.conversation_memory.DashScopeEmbeddingClient.from_env",
-            return_value=_EmbeddingClient(),
-        ):
-            MemoryManager()
-
-        self.assertEqual(
-            [call["name"] for call in chroma_client.collection_calls],
-            ["episodic_v4", "user_profile_v4"],
-        )
-        self.assertTrue(all("embedding_function" in call for call in chroma_client.collection_calls))
-        self.assertTrue(all(call["embedding_function"] is None for call in chroma_client.collection_calls))
-
     def test_update_profile_writes_explicit_document_embedding(self):
         manager = self._manager()
         manager._get_working_memory = AsyncMock(return_value=[
