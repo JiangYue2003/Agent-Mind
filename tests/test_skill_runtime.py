@@ -10,6 +10,29 @@ from skills.runtime import SkillRuntime, SkillStore, SkillValidationError
 
 
 class SkillRuntimeTests(unittest.TestCase):
+    def test_general_service_style_catalog_skill_matches_general_agent_without_tools(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = SkillRuntime(
+                catalog_dir=repo_root / "skills" / "catalog",
+                published_dir=root / "published",
+                drafts_dir=root / "drafts",
+                known_tools=set(),
+            )
+
+            runtime.refresh()
+
+            selected = runtime.select(
+                agent_role="general",
+                intent_category="greeting",
+                goal="knowledge",
+                planned_tools=[],
+            )
+
+            self.assertEqual([skill.id for skill in selected], ["general-service-style"])
+            self.assertEqual(selected[0].allowed_tools, ())
+
     def test_refresh_loads_a_skill_selected_by_agent_intent_goal_and_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

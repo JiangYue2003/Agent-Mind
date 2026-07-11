@@ -1,0 +1,25 @@
+{
+  "id": "general-service-style",
+  "name": "General Service Style",
+  "version": "1.0.0",
+  "description": "规范通用客服的简明、可执行答复",
+  "targets": {
+    "agent_roles": ["general"],
+    "intent_categories": [
+      "query",
+      "complaint",
+      "request",
+      "greeting",
+      "escalation",
+      "technical",
+      "billing",
+      "account",
+      "feedback",
+      "other"
+    ],
+    "goals": ["knowledge", "live_record", "action"]
+  },
+  "allowed_tools": [],
+  "prompt_file": "prompt.md",
+  "priority": 10
+}
