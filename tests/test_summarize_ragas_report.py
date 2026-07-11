@@ -13,6 +13,18 @@ class SummarizeRagasReportTests(unittest.TestCase):
             "status": "completed",
             "summary": {"total_cases": 4},
             "evaluation_config": {"top_k": 5, "recall_k": 15},
+            "retrieval": {
+                "raw_k": 15,
+                "final_k": 3,
+                "summary": {
+                    "answerable_cases": 2,
+                    "unanswerable_cases": 1,
+                    "raw": {"recall_at_k": 0.75, "hit_at_k": 1.0, "mrr_at_k": 0.6, "ndcg_at_k": 0.7},
+                    "reranked": {"recall_at_k": 0.5, "hit_at_k": 1.0, "mrr_at_k": 0.8, "ndcg_at_k": 0.9},
+                    "unanswerable_noise_rate_raw": 0.0,
+                    "unanswerable_noise_rate_reranked": 0.0,
+                },
+            },
             "records": [
                 {
                     "user_input": "退款多久到账？",
@@ -60,6 +72,10 @@ class SummarizeRagasReportTests(unittest.TestCase):
         self.assertEqual(summary["workflow"]["pass_rate"], 0.5)
         self.assertEqual(summary["coverage"]["knowledge_used_rate"], 0.6667)
         self.assertEqual(summary["coverage"]["rerank_applied_rate"], 0.6667)
+        self.assertEqual(summary["retrieval"]["raw_k"], 15)
+        self.assertEqual(summary["retrieval"]["final_k"], 3)
+        self.assertEqual(summary["retrieval"]["raw"]["recall_at_k"], 0.75)
+        self.assertEqual(summary["retrieval"]["reranked"]["mrr_at_k"], 0.8)
         self.assertEqual(summary["by_category"]["direct"]["factual_correctness"]["mean"], 0.4)
         self.assertEqual(summary["worst_cases"]["factual_correctness"][0]["case_id"], "order-001")
         self.assertEqual(summary["worst_cases"]["factual_correctness"][0]["user_input"], "订单状态是什么？")

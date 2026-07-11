@@ -44,9 +44,13 @@ class KnowledgeBase:
     DEFAULT_RECALL_TOP_K = 20
     DEFAULT_RRF_K = 60
     DEFAULT_RERANK_INSTRUCT = "Given a web search query, retrieve relevant passages that answer the query."
-    DEFAULT_RERANK_SCORE_THRESHOLD = 0.25
+    DEFAULT_RERANK_SCORE_THRESHOLD = 0.05
     DEFAULT_RERANK_TIMEOUT_SECONDS = 20.0
-    DEFAULT_RERANK_CANDIDATE_K = 4
+    DEFAULT_RERANK_CANDIDATE_K = 20
+    PARENT_CHUNK_SIZE = 300
+    PARENT_CHUNK_OVERLAP = 60
+    CHILD_CHUNK_SIZE = 100
+    CHILD_CHUNK_OVERLAP = 20
 
     def __init__(
         self,
@@ -126,7 +130,7 @@ class KnowledgeBase:
         批量导入文档到知识库。
 
         documents 格式: [{"title": "...", "content": "..."}, ...]
-        长文档会自动切片（每片 500 字）。
+        长文档会先切为 300 字父块，再切为 100 字子块。
         """
         if not hasattr(self, "_child_records"):
             self._child_records = []
@@ -206,6 +210,32 @@ class KnowledgeBase:
 
         self._rebuild_bm25_index()
         return total_added
+
+    def replace_documents(self, documents: List[Dict[str, str]]) -> int:
+        """Replace the active parent and child collections in one in-process rebuild."""
+        if not documents:
+            raise ValueError("documents must not be empty when replacing the knowledge base")
+
+        self._clear_collection_records(getattr(self, "_parent_collection", None))
+        self._clear_collection_records(getattr(self, "_child_collection", None))
+        self._child_records = []
+        self._bm25_doc_tokens = []
+        self._bm25_term_freqs = []
+        self._bm25_doc_freq = {}
+        self._bm25_avgdl = 0.0
+        return self.add_documents(documents)
+
+    def _clear_collection_records(self, collection: Any) -> None:
+        if collection is None:
+            return
+        try:
+            result = collection.get()
+            ids = [str(item) for item in self._flatten_result_rows(result.get("ids", []))]
+            if ids:
+                collection.delete(ids=ids)
+        except Exception as ex:
+            logger.warning(f"清空知识库集合失败: {ex}")
+            raise
 
     @staticmethod
     def _should_auto_seed() -> bool:
@@ -318,7 +348,7 @@ class KnowledgeBase:
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
-    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 80) -> List[str]:
+    def _chunk_text(self, text: str, chunk_size: int = 300, overlap: int = 60) -> List[str]:
         """段落优先切分，段落过长时按多标点句切，并在相邻块之间保留 overlap。"""
         normalized = self._normalize_text(text)
         if not normalized:
@@ -360,7 +390,11 @@ class KnowledgeBase:
         chunks: List[Dict[str, Any]] = []
 
         for section in sections:
-            section_chunks = self._chunk_text(section["content"])
+            section_chunks = self._chunk_text(
+                section["content"],
+                chunk_size=self.PARENT_CHUNK_SIZE,
+                overlap=self.PARENT_CHUNK_OVERLAP,
+            )
             for chunk in section_chunks:
                 chunk_index = len(chunks)
                 chunks.append({
@@ -381,7 +415,11 @@ class KnowledgeBase:
     def _build_child_chunks(self, parent_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         child_chunks: List[Dict[str, Any]] = []
         for parent in parent_chunks:
-            pieces = self._chunk_text(parent["content"], chunk_size=180, overlap=40)
+            pieces = self._chunk_text(
+                parent["content"],
+                chunk_size=self.CHILD_CHUNK_SIZE,
+                overlap=self.CHILD_CHUNK_OVERLAP,
+            )
             for child_idx, piece in enumerate(pieces):
                 child_chunks.append({
                     "doc_id": parent["doc_id"],
@@ -599,12 +637,14 @@ class KnowledgeBase:
                 raise ValueError("rerank 响应缺少 results")
 
             reranked: List[Dict[str, Any]] = []
+            valid_result_count = 0
             for item in results:
                 if not isinstance(item, dict):
                     continue
                 index = item.get("index")
                 if not isinstance(index, int) or not (0 <= index < len(candidates)):
                     continue
+                valid_result_count += 1
                 updated = dict(candidates[index])
                 rerank_score = round(float(item.get("relevance_score", updated.get("score", 0.0))), 4)
                 if rerank_score < getattr(self, "_rerank_score_threshold", self.DEFAULT_RERANK_SCORE_THRESHOLD):
@@ -615,16 +655,17 @@ class KnowledgeBase:
                 updated["rerank_provider"] = "dashscope"
                 reranked.append(updated)
 
-            if reranked:
-                if rerank_meta is not None:
-                    rerank_meta.update({
-                        "provider": "dashscope",
-                        "candidate_count": len(candidates),
-                        "returned_candidate_count": len(reranked[:top_n]),
-                        "fallback_used": False,
-                        "rerank_applied": True,
-                    })
-                return reranked[:top_n]
+            if valid_result_count == 0:
+                raise ValueError("rerank 响应没有有效候选索引")
+            if rerank_meta is not None:
+                rerank_meta.update({
+                    "provider": "dashscope",
+                    "candidate_count": len(candidates),
+                    "returned_candidate_count": len(reranked[:top_n]),
+                    "fallback_used": False,
+                    "rerank_applied": True,
+                })
+            return reranked[:top_n]
         except Exception as ex:
             logger.warning(f"qwen3-rerank 调用失败，回退到 RRF 排序: {ex}")
 
@@ -654,12 +695,14 @@ class KnowledgeBase:
                 raise ValueError("TEI rerank response must be a list")
 
             reranked: List[Dict[str, Any]] = []
+            valid_result_count = 0
             for item in results:
                 if not isinstance(item, dict):
                     continue
                 index = item.get("index")
                 if not isinstance(index, int) or not (0 <= index < len(candidates)):
                     continue
+                valid_result_count += 1
                 updated = dict(candidates[index])
                 rerank_score = round(float(item.get("score", updated.get("score", 0.0))), 4)
                 if rerank_score < getattr(self, "_rerank_score_threshold", self.DEFAULT_RERANK_SCORE_THRESHOLD):
@@ -670,16 +713,17 @@ class KnowledgeBase:
                 updated["rerank_provider"] = "tei"
                 reranked.append(updated)
 
-            if reranked:
-                if rerank_meta is not None:
-                    rerank_meta.update({
-                        "provider": "tei",
-                        "candidate_count": len(candidates),
-                        "returned_candidate_count": len(reranked[:top_n]),
-                        "fallback_used": False,
-                        "rerank_applied": True,
-                    })
-                return reranked[:top_n]
+            if valid_result_count == 0:
+                raise ValueError("TEI rerank response has no valid candidate indexes")
+            if rerank_meta is not None:
+                rerank_meta.update({
+                    "provider": "tei",
+                    "candidate_count": len(candidates),
+                    "returned_candidate_count": len(reranked[:top_n]),
+                    "fallback_used": False,
+                    "rerank_applied": True,
+                })
+            return reranked[:top_n]
         except Exception as ex:
             logger.warning(f"TEI rerank failed; falling back to RRF: {ex}")
 

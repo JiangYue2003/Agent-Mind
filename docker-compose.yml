@@ -83,7 +83,7 @@ services:
         - --max-batch-tokens
         - "8192"
         - --max-client-batch-size
-        - "12"
+        - "15"
     volumes:
       - reranker-model-cache:/data
     restart: unless-stopped
@@ -116,11 +116,11 @@ services:
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - RERANK_PROVIDER=tei
       - "RERANK_URL=${RERANK_URL:-http://host.docker.internal:18080/rerank}"
-      - RAG_HYBRID_RECALL_K=12
-      - RAG_RERANK_CANDIDATE_K=12
+      - RAG_HYBRID_RECALL_K=20
+      - RAG_RERANK_CANDIDATE_K=20
       - RAG_ANSWER_TOP_K=5
       - RAG_RERANK_TIMEOUT_SECONDS=20
-      - RAG_RERANK_SCORE_THRESHOLD=0
+      - RAG_RERANK_SCORE_THRESHOLD=0.05
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
@@ -155,7 +155,8 @@ services:
       - EVAL_WORKFLOW_DATASET=/app/evaluation/datasets/customer_service_workflow_v1.jsonl
       - EVAL_OUTPUT_DIR=/app/data/eval
       - EVAL_TOP_K=5
-      - EVAL_RECALL_K=12
+      - EVAL_RECALL_K=20
+      - EVAL_RETRIEVAL_GOLD_PATH=/app/evaluation/datasets/customer_service_retrieval_gold_v2.json
       - EVAL_REQUIRE_RERANK=true
       - EVAL_REQUIRED_RERANK_PROVIDER=tei
       - EVAL_MAX_CONCURRENCY=3

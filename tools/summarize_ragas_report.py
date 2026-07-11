@@ -27,6 +27,7 @@ def build_summary(report: Dict[str, Any]) -> Dict[str, Any]:
             "workflow_rows": len(workflow_rows),
         },
         "ragas_metrics": _summarize_rows(ragas_rows),
+        "retrieval": _retrieval_summary(report.get("retrieval")),
         "coverage": _coverage(records),
         "workflow": _workflow_summary(workflow_rows),
         "by_category": _grouped_summary(ragas_rows, record_index, "category"),
@@ -118,6 +119,23 @@ def _coverage(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "rerank_applied_rate": _rate(
             sum(bool(_as_dict(record.get("search")).get("rerank_applied")) for record in records), total
         ),
+    }
+
+
+def _retrieval_summary(value: Any) -> Dict[str, Any]:
+    retrieval = _as_dict(value)
+    summary = _as_dict(retrieval.get("summary"))
+    if not summary:
+        return {}
+    return {
+        "raw_k": _as_int(retrieval.get("raw_k")),
+        "final_k": _as_int(retrieval.get("final_k")),
+        "answerable_cases": _as_int(summary.get("answerable_cases")),
+        "unanswerable_cases": _as_int(summary.get("unanswerable_cases")),
+        "raw": _as_dict(summary.get("raw")),
+        "reranked": _as_dict(summary.get("reranked")),
+        "unanswerable_noise_rate_raw": summary.get("unanswerable_noise_rate_raw"),
+        "unanswerable_noise_rate_reranked": summary.get("unanswerable_noise_rate_reranked"),
     }
 
 

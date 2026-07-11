@@ -10,6 +10,16 @@ from typing import Any, Dict, List, Protocol
 
 import httpx
 
+from evaluation.retrieval_metrics import (
+    content_sha256,
+    evaluate_retrieval_records,
+    load_gold_chunk_hashes,
+    load_gold_chunk_keys,
+)
+
+
+DEFAULT_RETRIEVAL_GOLD_PATH = "evaluation/datasets/customer_service_retrieval_gold_v2.json"
+
 
 class AnthropicMessagesRagasLLM:
     """Mixin that routes Ragas Instructor LLM calls to Anthropic messages."""
@@ -95,7 +105,11 @@ def collect_deployed_records(
         evaluation_mode = str(case.get("evaluation_mode") or "knowledge")
         for turn_index, turn in enumerate(_case_turns(case)):
             question = turn["user_input"]
-            search_params: Dict[str, Any] = {"query": question, "top_k": top_k}
+            search_params: Dict[str, Any] = {
+                "query": question,
+                "top_k": top_k,
+                "include_debug": True,
+            }
             if recall_k is not None:
                 search_params["recall_k"] = recall_k
             search_response = client.post("/search", params=search_params)
@@ -115,6 +129,20 @@ def collect_deployed_records(
                         f"search for {case_id} turn {turn_index} did not use required reranker "
                         f"{required_rerank_provider!r}; got {rerank_providers!r}"
                     )
+            retrieval_debug = search_payload.get("retrieval_debug")
+            if not isinstance(retrieval_debug, dict):
+                raise ValueError(
+                    f"search for {case_id} turn {turn_index} did not return retrieval diagnostics; "
+                    "rebuild EchoMind before running retrieval evaluation"
+                )
+            raw_candidates = _extract_candidate_diagnostics(
+                retrieval_debug.get("raw_candidates"),
+                field_name="raw_candidates",
+            )
+            reranked_candidates = _extract_candidate_diagnostics(
+                retrieval_debug.get("reranked_candidates"),
+                field_name="reranked_candidates",
+            )
 
             chat_response = client.post(
                 "/chat",
@@ -150,6 +178,8 @@ def collect_deployed_records(
                     "recall_k": recall_k,
                     "rerank_applied": rerank_applied,
                     "rerank_providers": rerank_providers,
+                    "raw_candidates": raw_candidates,
+                    "reranked_candidates": reranked_candidates,
                 },
                 "chat": {
                     "knowledge_used": bool(chat_payload.get("knowledge_used", False)),
@@ -211,6 +241,75 @@ def validate_deployed_knowledge_base(cases: List[Dict[str, Any]], *, client: Htt
     if missing:
         raise ValueError(
             "deployed knowledge base is missing evaluation sources: " + ", ".join(missing)
+        )
+
+
+def validate_deployed_retrieval_gold(
+    cases: List[Dict[str, Any]],
+    *,
+    gold_chunk_keys: Dict[str, List[str]],
+    gold_chunk_hashes: Dict[str, str],
+    client: HttpClient,
+) -> None:
+    """Fail instead of scoring against gold keys from a different KB chunk revision."""
+    missing_case_ids = sorted(
+        str(case["case_id"])
+        for case in cases
+        if (
+            not case["unanswerable"]
+            and case.get("evaluation_mode", "knowledge") == "knowledge"
+            and not gold_chunk_keys.get(str(case["case_id"]))
+        )
+    )
+    if missing_case_ids:
+        raise ValueError(
+            "missing retrieval gold for answerable cases: " + ", ".join(missing_case_ids)
+        )
+    required_keys = {
+        chunk_key
+        for case in cases
+        if not case["unanswerable"] and case.get("evaluation_mode", "knowledge") == "knowledge"
+        for chunk_key in gold_chunk_keys.get(str(case["case_id"]), [])
+    }
+    missing_hashes = sorted(required_keys - set(gold_chunk_hashes))
+    if missing_hashes:
+        raise ValueError(
+            "missing retrieval gold content hashes for child chunks: " + ", ".join(missing_hashes[:5])
+        )
+    response = client.get("/knowledge/chunks", params={"limit": 5000})
+    response.raise_for_status()
+    payload = response.json()
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    deployed_hashes: Dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        chunk_key = str(item.get("chunk_key", "")).strip()
+        if not chunk_key:
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            raise ValueError(f"deployed knowledge chunk {chunk_key!r} has no string content")
+        deployed_hashes[chunk_key] = content_sha256(content)
+    missing = sorted(required_keys - set(deployed_hashes))
+    if missing:
+        preview = ", ".join(missing[:5])
+        suffix = " ..." if len(missing) > 5 else ""
+        raise ValueError(
+            "deployed knowledge base is missing retrieval gold child chunks: "
+            f"{preview}{suffix}; rebuild the gold mapping after changing KB chunks"
+        )
+    changed = sorted(
+        chunk_key
+        for chunk_key in required_keys
+        if deployed_hashes[chunk_key] != gold_chunk_hashes[chunk_key]
+    )
+    if changed:
+        preview = ", ".join(changed[:5])
+        suffix = " ..." if len(changed) > 5 else ""
+        raise ValueError(
+            "deployed knowledge base content hashes do not match retrieval gold: "
+            f"{preview}{suffix}; rebuild the gold mapping after changing KB content"
         )
 
 
@@ -356,12 +455,25 @@ def run_deployed_evaluation(
     required_rerank_provider: str = "",
     max_concurrency: int = 3,
     workflow_dataset_path: Path | None = None,
+    retrieval_gold_path: Path | None = None,
 ) -> Dict[str, Any]:
     """Collect one deployed run, evaluate answerable records, and persist its report."""
     cases = load_eval_cases(dataset_path)
     if workflow_dataset_path is not None:
         cases.extend(load_eval_cases(workflow_dataset_path))
+    gold_chunk_keys = load_gold_chunk_keys(
+        retrieval_gold_path or Path(DEFAULT_RETRIEVAL_GOLD_PATH)
+    )
+    gold_chunk_hashes = load_gold_chunk_hashes(
+        retrieval_gold_path or Path(DEFAULT_RETRIEVAL_GOLD_PATH)
+    )
     validate_deployed_knowledge_base(cases, client=client)
+    validate_deployed_retrieval_gold(
+        cases,
+        gold_chunk_keys=gold_chunk_keys,
+        gold_chunk_hashes=gold_chunk_hashes,
+        client=client,
+    )
     records = collect_deployed_records(
         cases,
         client=client,
@@ -370,6 +482,12 @@ def run_deployed_evaluation(
         recall_k=recall_k,
         require_rerank=require_rerank,
         required_rerank_provider=required_rerank_provider,
+    )
+    retrieval_report = evaluate_retrieval_records(
+        records,
+        gold_chunk_keys=gold_chunk_keys,
+        raw_k=recall_k or top_k,
+        final_k=top_k,
     )
     unanswerable_cases = sum(1 for case in cases if case["unanswerable"])
     report = {
@@ -389,6 +507,7 @@ def run_deployed_evaluation(
             ),
         },
         "records": records,
+        "retrieval": retrieval_report,
         "ragas_rows": [],
         "evaluation_config": {
             "top_k": top_k,
@@ -396,6 +515,7 @@ def run_deployed_evaluation(
             "require_rerank": require_rerank,
             "required_rerank_provider": required_rerank_provider,
             "max_concurrency": max_concurrency,
+            "retrieval_gold_path": str(retrieval_gold_path or DEFAULT_RETRIEVAL_GOLD_PATH),
         },
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -477,11 +597,12 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=os.getenv("EVAL_OUTPUT_DIR", "data/eval"))
     parser.add_argument("--run-id", default=os.getenv("EVAL_RUN_ID", ""))
     parser.add_argument("--top-k", type=int, default=int(os.getenv("EVAL_TOP_K", "5")))
-    parser.add_argument("--recall-k", type=int, default=int(os.getenv("EVAL_RECALL_K", "12")))
+    parser.add_argument("--recall-k", type=int, default=int(os.getenv("EVAL_RECALL_K", "20")))
     parser.add_argument("--max-concurrency", type=int, default=int(os.getenv("EVAL_MAX_CONCURRENCY", "3")))
     parser.add_argument("--require-rerank", default=os.getenv("EVAL_REQUIRE_RERANK", "false"))
     parser.add_argument("--required-rerank-provider", default=os.getenv("EVAL_REQUIRED_RERANK_PROVIDER", ""))
     parser.add_argument("--workflow-dataset", default=os.getenv("EVAL_WORKFLOW_DATASET", ""))
+    parser.add_argument("--retrieval-gold", default=os.getenv("EVAL_RETRIEVAL_GOLD_PATH", DEFAULT_RETRIEVAL_GOLD_PATH))
     parser.add_argument("--resume", default="", help="saved report path to score without recollecting")
     args = parser.parse_args(argv)
 
@@ -511,6 +632,7 @@ def main(argv: List[str] | None = None) -> int:
                 required_rerank_provider=args.required_rerank_provider,
                 max_concurrency=args.max_concurrency,
                 workflow_dataset_path=Path(args.workflow_dataset) if args.workflow_dataset else None,
+                retrieval_gold_path=Path(args.retrieval_gold),
             )
     summary = report["summary"]
     print(
@@ -582,6 +704,24 @@ def _extract_contexts(results: Any) -> List[str]:
         if content:
             contexts.append(content)
     return contexts
+
+
+def _extract_candidate_diagnostics(value: Any, *, field_name: str) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError(f"retrieval diagnostics field {field_name!r} must be a list")
+    candidates: List[Dict[str, Any]] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"retrieval diagnostics field {field_name!r} has a non-object candidate")
+        chunk_key = str(item.get("chunk_key", "")).strip()
+        if not chunk_key:
+            raise ValueError(f"retrieval diagnostics field {field_name!r} candidate {index} lacks chunk_key")
+        candidates.append({
+            "chunk_key": chunk_key,
+            "rank": int(item.get("rank", index)),
+            "score": float(item.get("score", 0.0)),
+        })
+    return candidates
 
 
 def _extract_rerank_providers(value: Any) -> List[str]:

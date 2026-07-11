@@ -569,9 +569,11 @@ async def _build_knowledge_context(
         parts = ["[知识库检索结果]"]
         used = False
         prompt_blocks = []
-        for i, item in enumerate(result.data[:resolved_top_k], start=1):
+        seen_parent_ids = set()
+        for item in result.data[:resolved_top_k]:
             if not isinstance(item, dict):
                 continue
+            parent_id = str(item.get("parent_id", "")).strip()
             title = str(item.get("title", "未命名文档"))
             content = str(item.get("matched_child_content") or item.get("content", "")).strip()
             parent_content = str(item.get("parent_content", "")).strip()
@@ -579,7 +581,12 @@ async def _build_knowledge_context(
             score = item.get("score", "")
             if not content:
                 continue
+            if parent_id and parent_id in seen_parent_ids:
+                continue
+            if parent_id:
+                seen_parent_ids.add(parent_id)
             used = True
+            i = len(prompt_blocks) + 1
             block = [
                 f"{i}. 标题: {title}",
                 f"   相关路径: {heading_path}",
@@ -1434,7 +1441,12 @@ async def prometheus_metrics():
 
 
 @app.post("/search")
-async def search(query: str, top_k: int = 5, recall_k: Optional[int] = None):
+async def search(
+    query: str,
+    top_k: int = 5,
+    recall_k: Optional[int] = None,
+    include_debug: bool = False,
+):
     """
     演示检索优化链路：查询改写 → 并行召回 → 重排 → Top-K。
     展示 MCP 工具调用的核心亮点。
@@ -1457,7 +1469,7 @@ async def search(query: str, top_k: int = 5, recall_k: Optional[int] = None):
         isinstance(item, dict) and item.get("rerank_applied") is True
         for item in results
     )
-    return {
+    payload = {
         "query": query,
         "results": results,
         "reranked": result.reranked,
@@ -1466,6 +1478,9 @@ async def search(query: str, top_k: int = 5, recall_k: Optional[int] = None):
         "top_k": top_k,
         "recall_k": recall_k,
     }
+    if include_debug:
+        payload["retrieval_debug"] = result.retrieval_debug
+    return payload
 
 
 class DocInput(BaseModel):
@@ -1505,7 +1520,7 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字）并存入 ChromaDB，ChromaDB 内置 Embedding 模型自动向量化。
+    文档会先切为 300 字父块，再切为 100 字子块并存入 ChromaDB。
 
     示例请求体：
     ```json
@@ -1529,6 +1544,29 @@ async def add_knowledge(body: BatchDocInput):
         for d in body.documents
     ])
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": kb.doc_count}
+
+
+@app.post("/knowledge/replace", tags=["知识库"])
+async def replace_knowledge(body: BatchDocInput):
+    """Replace all active knowledge documents and rebuild parent, child, and BM25 indexes."""
+    tool = _tool_manager._tools.get("knowledge_search") if _tool_manager else None
+    if tool is None:
+        raise HTTPException(503, "知识库未初始化")
+    if not body.documents:
+        raise HTTPException(400, "至少需要提供一篇文档")
+    kb = tool.handler.__self__
+    count = kb.replace_documents([
+        {
+            "title": document.title,
+            "content": document.content,
+        }
+        for document in body.documents
+    ])
+    return {
+        "message": f"已替换知识库并重建 {count} 个文档片段",
+        "added_chunks": count,
+        "total_chunks": kb.doc_count,
+    }
 
 
 @app.post("/knowledge/upload", tags=["知识库"])

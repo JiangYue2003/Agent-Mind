@@ -101,7 +101,7 @@ python -m dotenv run -- python -m evaluation.ragas_runner `
   --workflow-dataset evaluation/datasets/customer_service_workflow_v1.jsonl `
   --output-dir data/eval `
   --top-k 5 `
-  --recall-k 12 `
+  --recall-k 20 `
   --require-rerank true `
   --required-rerank-provider tei `
   --max-concurrency 3
@@ -127,17 +127,21 @@ docker compose --profile eval run --rm ragas-eval
 
 Optional environment variables are `EVAL_RUN_ID`, `EVAL_TOP_K`,
 `EVAL_RECALL_K`, `EVAL_REQUIRE_RERANK`, `EVAL_REQUIRED_RERANK_PROVIDER`,
-`EVAL_MAX_CONCURRENCY`, `EVAL_DATASET_PATH`, `EVAL_WORKFLOW_DATASET`, and
-`EVAL_OUTPUT_DIR`. The defaults recall 12 candidates before the local GPU
-reranker produces Top-K 5, require the TEI-compatible `tei` protocol marker
+`EVAL_MAX_CONCURRENCY`, `EVAL_DATASET_PATH`, `EVAL_WORKFLOW_DATASET`,
+`EVAL_RETRIEVAL_GOLD_PATH`, and `EVAL_OUTPUT_DIR`. The defaults recall 20
+candidates before the local GPU reranker produces Top-K 5, require the
+TEI-compatible `tei` protocol marker
 for answerable knowledge cases, run at most three RAGAS
 metric tasks at once, and use the customer-service dataset plus workflow cases.
 
-Query rewrites each perform hybrid recall, then their candidates are merged
-and deduplicated before one global TEI-compatible rerank. This prevents one user request
+Query rewrites each perform hybrid recall, then their child-chunk candidates are merged
+and deduplicated by `parent_id + child_chunk_index` before one global TEI-compatible rerank. This prevents one user request
 from overwhelming the reranker with one rerank request per rewrite.
-The host-native `local_reranker` service scores the 12 highest RRF-scored
-candidates in one GPU batch before reranking to Top-K 5. Start it before the
+The host-native `local_reranker` service scores up to 20 highest RRF-scored
+child candidates in one GPU batch before reranking to Top-K 5. Children below
+the `0.05` rerank-score threshold are discarded; parent deduplication happens
+only when final context is assembled for `/chat` and does not backfill lower-ranked children.
+Start it before the
 Compose application and verify its `/health` endpoint from the `echomind`
 container. RAGAS scoring concurrency remains limited to three because that
 limit protects the remote evaluation-model API, not the reranker.
@@ -163,7 +167,28 @@ docker compose --profile eval run --rm ragas-eval --resume /app/data/eval/<run_i
 
 ## Metrics
 
-The current run focuses on answer quality rather than retrieval ranking:
+Each evaluation turn calls `/search` once with `recall_k=20`, `top_k=5`, and
+`include_debug=true`. It then computes deterministic retrieval metrics without
+additional model or retrieval calls:
+
+- `retrieval.raw` evaluates the merged child-chunk RRF candidate list at
+  `Recall@20`, `Hit@20`, `MRR@20`, and `nDCG@20`.
+- `retrieval.reranked` evaluates the same metrics after the local GPU reranker
+  returns its final Top-5 child chunks.
+- Unanswerable cases do not enter those averages; their raw and reranked noise
+  rates show how often either layer returns any candidate.
+
+The versioned `customer_service_retrieval_gold_v2.json` maps every answerable
+knowledge case to an active child-chunk key and records that chunk's SHA-256
+content hash. The run fails before collection if the deployed
+`/knowledge/chunks` no longer contains a required key or its content changed,
+rather than silently evaluating against a stale KB revision. Both retrieval
+layers use child chunks as their evaluation unit; the parent block is only a
+prompt-assembly concern for `/chat`.
+
+`/search`, `/chat`, and both evaluation runners use final Top-K 5. `/chat`
+deduplicates those five child chunks by parent only while assembling the prompt;
+its answer metrics remain independent:
 
 - `FactualCorrectness` compares the answer with its reference answer.
 - `AnswerRelevancy` checks whether the answer addresses the user request.
@@ -180,6 +205,12 @@ assigned an RRF fallback score.
 The five unanswerable cases remain in the raw report for manual or custom
 refusal-policy review; they are not averaged with answerable RAGAS scores.
 
+Use the built-in summary to inspect both answer and retrieval aggregates:
+
+```powershell
+python -m tools.summarize_ragas_report data/eval/<run_id>.json
+```
+
 `AnswerRelevancy` uses the remote embedding endpoint only for the evaluation
 container. The application container does not receive its embedding credential.
 
@@ -192,3 +223,36 @@ embedding service. The runner therefore writes a checkpoint after every
 completed record and uses `EVAL_MAX_CONCURRENCY=3` by default. It is safe to
 raise this value gradually only after confirming the DeepSeek endpoint and
 embedding endpoint do not rate-limit the run.
+
+## Retrieval-Only Evaluation
+
+`customer_service_search_v1.jsonl` is separate from the answer and workflow
+datasets. It contains 70 static knowledge-retrieval cases and 10 OOD cases;
+it never calls `/chat`, so workflow slot collection, order lookup, and answer
+generation cannot change the result.
+
+After a parent/child chunking change, replace the active knowledge base through
+`POST /knowledge/replace` before running either evaluator. The request must
+contain every current customer-service document with its filename stem as
+`title`; this resets the active parent collection, child collection, and BM25
+index together. The v2 Gold files correspond to 300-character parent chunks
+and 100-character child chunks with 60/20-character overlap.
+
+```powershell
+cd F:\AI-agent\EchoMind
+conda activate ragas
+python -m evaluation.retrieval_runner `
+  --base-url http://127.0.0.1:8000 `
+  --dataset evaluation/datasets/customer_service_search_v1.jsonl `
+  --gold evaluation/datasets/customer_service_search_gold_v2.json `
+  --output-dir data/eval `
+  --top-k 5 `
+  --recall-k 20 `
+  --require-rerank true `
+  --required-rerank-provider tei
+```
+
+The report contains raw `Recall@20`, `Hit@20`, `MRR@20`, and `nDCG@20`, then
+the same metrics for reranked Top-5 child chunks. The 10 OOD cases are excluded from those
+averages and contribute only raw and reranked candidate-noise rates. The runner
+validates every gold child chunk and its content hash before issuing searches.

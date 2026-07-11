@@ -45,3 +45,4 @@ docker-compose(1).yml
 /Typora_Hook_Log.txt
 /docker-compose.dev.yml
 /docs/superpowers/specs/Typora_Hook_Log.txt
+/evaluation/datasets/customer_service_workflow_smoke_v1.jsonl

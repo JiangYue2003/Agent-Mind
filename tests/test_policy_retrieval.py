@@ -3,6 +3,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def _load_knowledge_base_module():
@@ -83,6 +84,18 @@ class FakeEmbeddingClient:
 
 
 class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
+    def test_child_first_chunking_uses_300_char_parents_100_char_children_and_point_zero_five_threshold(self):
+        kb = KnowledgeBase.__new__(KnowledgeBase)
+        content = "规" * 420
+
+        parents = kb._build_structured_chunks("退款规则", content)
+        children = kb._build_child_chunks(parents)
+
+        self.assertGreaterEqual(len(parents), 2)
+        self.assertTrue(all(len(parent["content"]) <= 300 for parent in parents))
+        self.assertTrue(all(len(child["content"]) <= 100 for child in children))
+        self.assertEqual(KnowledgeBase.DEFAULT_RERANK_SCORE_THRESHOLD, 0.05)
+
     def _make_kb(self):
         kb = KnowledgeBase.__new__(KnowledgeBase)
         kb._child_records = []
@@ -174,6 +187,51 @@ class KnowledgeBasePolicyRetrievalTests(unittest.TestCase):
         self.assertNotIn("version_no", child_meta)
         self.assertNotIn("effective_at", child_meta)
         self.assertNotIn("policy_id", child_meta)
+
+    def test_replace_documents_rebuilds_parent_child_and_bm25_records(self):
+        kb = self._make_kb()
+        kb.add_documents([{
+            "title": "旧规则",
+            "content": "旧知识库内容。",
+        }])
+
+        added = kb.replace_documents([{
+            "title": "新规则",
+            "content": "新知识库内容。",
+        }])
+
+        self.assertGreater(added, 0)
+        self.assertTrue(kb._child_records)
+        self.assertTrue(all(record["title"] == "新规则" for record in kb._child_records))
+        self.assertTrue(all("旧知识库内容" not in item["document"] for item in kb._child_collection.records.values()))
+
+    def test_tei_rerank_keeps_an_empty_threshold_filtered_result_instead_of_falling_back(self):
+        kb = KnowledgeBase.__new__(KnowledgeBase)
+        kb._rerank_url = "http://reranker:80/rerank"
+        kb._rerank_timeout_seconds = 20.0
+        kb._rerank_score_threshold = 0.2
+        metadata = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"index": 0, "score": 0.1}]
+
+        with mock.patch.object(knowledge_base_module.httpx, "post", return_value=FakeResponse()):
+            reranked = kb._rerank_with_tei(
+                "知识库外的问题",
+                [{"content": "不相关候选", "score": 0.03}],
+                top_n=5,
+                rerank_meta=metadata,
+            )
+
+        self.assertEqual(reranked, [])
+        self.assertEqual(metadata["provider"], "tei")
+        self.assertEqual(metadata["returned_candidate_count"], 0)
+        self.assertFalse(metadata["fallback_used"])
+        self.assertTrue(metadata["rerank_applied"])
 
 
 if __name__ == "__main__":

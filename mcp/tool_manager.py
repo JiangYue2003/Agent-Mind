@@ -68,6 +68,7 @@ class ToolResult:
     cached:         bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
+    retrieval_debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -157,7 +158,7 @@ class MCPToolManager:
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
     """
 
-    DEFAULT_RERANK_RECALL_K = 12
+    DEFAULT_RERANK_RECALL_K = 20
 
     def __init__(self, api_key: str, base_url: Optional[str] = None, model: str = "claude-3-5-sonnet-20241022"):
         kwargs: Dict[str, Any] = {"api_key": api_key}
@@ -406,9 +407,10 @@ class MCPToolManager:
 
         if use_tool_reranker:
             merged.sort(key=lambda item: item.get("score", 0.0) if isinstance(item, dict) else 0.0, reverse=True)
+            raw_candidates = merged[:effective_recall_k]
 
             async def run_tool_rerank() -> List[Any]:
-                reranked = tool.rerank_handler(query, merged, top_k, context)
+                reranked = tool.rerank_handler(query, raw_candidates, top_k, context)
                 if asyncio.iscoroutine(reranked):
                     reranked = await reranked
                 return reranked
@@ -424,12 +426,26 @@ class MCPToolManager:
                 data=reranked,
                 tool_name=tool_name,
                 reranked=bool(reranked) and all(self._has_real_rerank(item) for item in reranked),
+                retrieval_debug={
+                    "raw_candidates": self._candidate_diagnostics(raw_candidates),
+                    "reranked_candidates": self._candidate_diagnostics(reranked),
+                },
             )
 
         # 4. 检索工具若已完成内部精排，则直接截断返回；否则使用外层 LLM 重排
         if all(self._has_real_rerank(item) for item in merged):
             merged.sort(key=lambda item: item.get("score", item.get("rerank_score", 0.0)), reverse=True)
-            return ToolResult(success=True, data=merged[:top_k], tool_name=tool_name, reranked=True)
+            reranked = merged[:top_k]
+            return ToolResult(
+                success=True,
+                data=reranked,
+                tool_name=tool_name,
+                reranked=True,
+                retrieval_debug={
+                    "raw_candidates": self._candidate_diagnostics(merged[:effective_recall_k]),
+                    "reranked_candidates": self._candidate_diagnostics(reranked),
+                },
+            )
 
         if trace is None:
             reranked = await self._rerank(query, merged, top_k)
@@ -441,6 +457,10 @@ class MCPToolManager:
             data=reranked,
             tool_name=tool_name,
             reranked=bool(reranked) and all(self._has_real_rerank(item) for item in reranked),
+            retrieval_debug={
+                "raw_candidates": self._candidate_diagnostics(merged[:effective_recall_k]),
+                "reranked_candidates": self._candidate_diagnostics(reranked),
+            },
         )
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
@@ -499,7 +519,11 @@ class MCPToolManager:
         if isinstance(item, dict):
             parent_id = item.get("parent_id")
             if parent_id:
-                return f"parent:{parent_id}"
+                child_chunk = item.get(
+                    "matched_child_chunk",
+                    item.get("child_chunk_index", item.get("chunk", 0)),
+                )
+                return f"child:{parent_id}:{child_chunk}"
 
             doc_id = item.get("doc_id")
             chunk = item.get("chunk")
@@ -511,6 +535,28 @@ class MCPToolManager:
                 return f"content:{hashlib.md5(str(content).encode()).hexdigest()}"
 
         return f"fallback:{hashlib.md5(str(item).encode()).hexdigest()}"
+
+    @staticmethod
+    def _candidate_diagnostics(items: List[Any]) -> List[Dict[str, Any]]:
+        diagnostics: List[Dict[str, Any]] = []
+        for rank, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                continue
+            parent_id = str(item.get("parent_id", "") or "")
+            child_index = item.get(
+                "matched_child_chunk",
+                item.get("child_chunk_index", item.get("chunk", 0)),
+            )
+            chunk_key = f"{parent_id}:{child_index}" if parent_id else ""
+            if not chunk_key:
+                continue
+            score = item.get("rerank_score", item.get("score", 0.0))
+            diagnostics.append({
+                "chunk_key": chunk_key,
+                "rank": rank,
+                "score": float(score),
+            })
+        return diagnostics
 
     @staticmethod
     def _has_real_rerank(item: Any) -> bool:

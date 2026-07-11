@@ -28,13 +28,15 @@ class DockerComposeRuntimeConfigTests(unittest.TestCase):
         self.assertIn("gpus: all", reranker_block)
         self.assertIn('profiles: ["tei"]', reranker_block)
         self.assertIn('- --max-concurrent-requests\n        - "4"', reranker_block)
-        self.assertIn('- --max-client-batch-size\n        - "12"', reranker_block)
+        self.assertIn('- --max-client-batch-size\n        - "15"', reranker_block)
         self.assertIn("reranker-model-cache:/data", reranker_block)
         self.assertNotIn("ports:", reranker_block)
         self.assertIn("- RERANK_PROVIDER=tei", echomind_block)
         self.assertIn("RERANK_URL=${RERANK_URL:-http://host.docker.internal:18080/rerank}", echomind_block)
-        self.assertIn("- RAG_HYBRID_RECALL_K=12", echomind_block)
-        self.assertIn("- RAG_RERANK_CANDIDATE_K=12", echomind_block)
+        self.assertIn("- RAG_HYBRID_RECALL_K=20", echomind_block)
+        self.assertIn("- RAG_RERANK_CANDIDATE_K=20", echomind_block)
+        self.assertIn("- RAG_ANSWER_TOP_K=5", echomind_block)
+        self.assertIn("- RAG_RERANK_SCORE_THRESHOLD=0.05", echomind_block)
         self.assertNotIn("reranker:\n        condition", echomind_block)
 
     def test_embedding_v4_settings_are_documented_without_credentials(self):
@@ -45,6 +47,15 @@ class DockerComposeRuntimeConfigTests(unittest.TestCase):
         self.assertIn("DASHSCOPE_WORKSPACE=ws-your_workspace", env_example)
         self.assertIn("EMBEDDING_MODEL=text-embedding-v4", env_example)
         self.assertIn("EMBEDDING_DIMENSION=1024", env_example)
+
+    def test_evaluation_defaults_use_recall_20_and_reranked_top_5(self):
+        env_example = Path(".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("EVAL_TOP_K=5", env_example)
+        self.assertIn("EVAL_RECALL_K=20", env_example)
+        self.assertIn("RAG_HYBRID_RECALL_K=20", env_example)
+        self.assertIn("RAG_RERANK_CANDIDATE_K=20", env_example)
+        self.assertIn("RAG_RERANK_SCORE_THRESHOLD=0.05", env_example)
 
 
 if __name__ == "__main__":

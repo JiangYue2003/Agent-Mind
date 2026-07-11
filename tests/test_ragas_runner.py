@@ -1,5 +1,6 @@
 import asyncio
 import json
+import hashlib
 import math
 import pathlib
 import sys
@@ -24,6 +25,7 @@ from evaluation.ragas_runner import (
     run_deployed_evaluation,
     run_ragas_evaluation,
     validate_deployed_knowledge_base,
+    validate_deployed_retrieval_gold,
 )
 
 
@@ -52,6 +54,15 @@ class _FakeHttpClient:
                 ],
                 "rerank_applied": True,
                 "rerank_providers": ["tei"],
+                "retrieval_debug": {
+                    "raw_candidates": [
+                        {"chunk_key": "a48b9e42d31f1feab91766a1578294de:parent:0:0", "rank": 1, "score": 0.4},
+                        {"chunk_key": "noise:0", "rank": 2, "score": 0.2},
+                    ],
+                    "reranked_candidates": [
+                        {"chunk_key": "a48b9e42d31f1feab91766a1578294de:parent:0:0", "rank": 1, "score": 0.9},
+                    ],
+                },
             })
         if path == "/chat":
             return _FakeResponse({
@@ -65,7 +76,13 @@ class _FakeHttpClient:
     def get(self, path, params=None):
         self.calls.append({"path": path, "params": params, "json": None})
         if path == "/knowledge/chunks":
-            return _FakeResponse({"items": [{"title": "退款到账时间说明"}]})
+            return _FakeResponse({"items": [{
+                "title": "退款到账时间说明",
+                "chunk_key": "a48b9e42d31f1feab91766a1578294de:parent:0:0",
+                "parent_id": "a48b9e42d31f1feab91766a1578294de:parent:0",
+                "child_chunk_index": 0,
+                "content": "fake refund chunk",
+            }]})
         if path == "/traces/trace-001":
             return _FakeResponse({
                 "stages": [{
@@ -145,9 +162,13 @@ class RagasRunnerTests(unittest.TestCase):
         self.assertEqual(records[0]["reference"], case["reference"])
         self.assertEqual(records[0]["reference_contexts"], case["reference_contexts"])
         self.assertEqual(records[0]["metadata"]["case_id"], case["case_id"])
+        self.assertEqual(
+            records[0]["search"]["raw_candidates"][0]["chunk_key"],
+            "a48b9e42d31f1feab91766a1578294de:parent:0:0",
+        )
         self.assertEqual(client.calls[0], {
             "path": "/search",
-            "params": {"query": case["user_input"], "top_k": 2},
+            "params": {"query": case["user_input"], "top_k": 2, "include_debug": True},
             "json": None,
         })
         self.assertEqual(client.calls[1], {
@@ -244,6 +265,105 @@ class RagasRunnerTests(unittest.TestCase):
                 require_rerank=True,
                 required_rerank_provider="tei",
                 run_id="test-run",
+            )
+
+    def test_collect_deployed_records_rejects_search_without_retrieval_diagnostics(self):
+        case = {
+            "case_id": "refund-arrival-001",
+            "user_input": "银行卡退款审核通过后多久到账？",
+            "reference": "审核通过后，银行卡退款通常在 1-3 个工作日内到账。",
+            "reference_contexts": ["审核通过后，银行卡退款通常在 1-3 个工作日内到账。"],
+            "source_file": "退款到账时间说明.md",
+            "category": "direct",
+            "difficulty": "easy",
+            "unanswerable": False,
+        }
+
+        class NoDiagnosticsClient(_FakeHttpClient):
+            def post(self, path, params=None, json=None):
+                response = super().post(path, params=params, json=json)
+                if path == "/search":
+                    response._payload.pop("retrieval_debug")
+                return response
+
+        with self.assertRaisesRegex(ValueError, "retrieval diagnostics"):
+            collect_deployed_records(
+                [case],
+                client=NoDiagnosticsClient(),
+                top_k=3,
+                recall_k=15,
+                run_id="test-run",
+            )
+
+    def test_collect_deployed_records_rejects_search_without_both_candidate_layers(self):
+        case = {
+            "case_id": "refund-arrival-001",
+            "user_input": "银行卡退款审核通过后多久到账？",
+            "reference": "审核通过后，银行卡退款通常在 1-3 个工作日内到账。",
+            "reference_contexts": ["审核通过后，银行卡退款通常在 1-3 个工作日内到账。"],
+            "source_file": "退款到账时间说明.md",
+            "category": "direct",
+            "difficulty": "easy",
+            "unanswerable": False,
+        }
+
+        class MissingRawCandidatesClient(_FakeHttpClient):
+            def post(self, path, params=None, json=None):
+                response = super().post(path, params=params, json=json)
+                if path == "/search":
+                    response._payload["retrieval_debug"].pop("raw_candidates")
+                return response
+
+        with self.assertRaisesRegex(ValueError, "raw_candidates"):
+            collect_deployed_records(
+                [case],
+                client=MissingRawCandidatesClient(),
+                top_k=3,
+                recall_k=15,
+                run_id="test-run",
+            )
+
+    def test_validate_deployed_retrieval_gold_rejects_stale_chunk_keys(self):
+        case = {
+            "case_id": "refund-arrival-001",
+            "source_file": "退款到账时间说明.md",
+            "unanswerable": False,
+        }
+        with self.assertRaisesRegex(ValueError, "gold child chunks"):
+            validate_deployed_retrieval_gold(
+                [case],
+                gold_chunk_keys={"refund-arrival-001": ["missing:parent:0:0"]},
+                gold_chunk_hashes={"missing:parent:0:0": "0" * 64},
+                client=_FakeHttpClient(),
+            )
+
+    def test_validate_deployed_retrieval_gold_rejects_case_without_gold_mapping(self):
+        case = {
+            "case_id": "refund-arrival-001",
+            "source_file": "退款到账时间说明.md",
+            "unanswerable": False,
+        }
+        with self.assertRaisesRegex(ValueError, "missing retrieval gold"):
+            validate_deployed_retrieval_gold(
+                [case],
+                gold_chunk_keys={},
+                gold_chunk_hashes={},
+                client=_FakeHttpClient(),
+            )
+
+    def test_validate_deployed_retrieval_gold_rejects_changed_chunk_content(self):
+        case = {
+            "case_id": "refund-arrival-001",
+            "source_file": "退款到账时间说明.md",
+            "unanswerable": False,
+        }
+        key = "a48b9e42d31f1feab91766a1578294de:parent:0:0"
+        with self.assertRaisesRegex(ValueError, "content hashes"):
+            validate_deployed_retrieval_gold(
+                [case],
+                gold_chunk_keys={"refund-arrival-001": [key]},
+                gold_chunk_hashes={key: "0" * 64},
+                client=_FakeHttpClient(),
             )
 
     def test_build_ragas_samples_excludes_unanswerable_cases(self):
@@ -708,6 +828,12 @@ class RagasRunnerTests(unittest.TestCase):
             root = pathlib.Path(temp_dir)
             dataset_path = root / "cases.jsonl"
             dataset_path.write_text(json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8")
+            gold_key = "a48b9e42d31f1feab91766a1578294de:parent:0:0"
+            gold_path = root / "retrieval-gold.json"
+            gold_path.write_text(json.dumps({
+                "case_gold_chunk_keys": {"refund-arrival-001": [gold_key]},
+                "chunk_content_sha256": {gold_key: hashlib.sha256(b"fake refund chunk").hexdigest()},
+            }), encoding="utf-8")
             with mock.patch(
                 "evaluation.ragas_runner.run_ragas_evaluation",
                 return_value=[{"context_precision": 0.8, "faithfulness": 0.9}],
@@ -719,7 +845,9 @@ class RagasRunnerTests(unittest.TestCase):
                     evaluator_llm="judge",
                     evaluator_embeddings="embeddings",
                     run_id="test-run",
-                    top_k=2,
+                    top_k=3,
+                    recall_k=15,
+                    retrieval_gold_path=gold_path,
                 )
 
             saved = json.loads((root / "output" / "test-run.json").read_text(encoding="utf-8"))
@@ -732,6 +860,10 @@ class RagasRunnerTests(unittest.TestCase):
         })
         self.assertEqual(saved["ragas_rows"], [{"context_precision": 0.8, "faithfulness": 0.9}])
         self.assertEqual(saved["records"][0]["metadata"]["case_id"], "refund-arrival-001")
+        self.assertEqual(saved["retrieval"]["raw_k"], 15)
+        self.assertEqual(saved["retrieval"]["final_k"], 3)
+        self.assertEqual(saved["retrieval"]["summary"]["raw"]["recall_at_k"], 1.0)
+        self.assertEqual(saved["retrieval"]["summary"]["reranked"]["hit_at_k"], 1.0)
         self.assertEqual(saved["status"], "completed")
 
     def test_run_deployed_evaluation_saves_collected_records_when_scoring_fails(self):
@@ -751,6 +883,12 @@ class RagasRunnerTests(unittest.TestCase):
             root = pathlib.Path(temp_dir)
             dataset_path = root / "cases.jsonl"
             dataset_path.write_text(json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8")
+            gold_key = "a48b9e42d31f1feab91766a1578294de:parent:0:0"
+            gold_path = root / "retrieval-gold.json"
+            gold_path.write_text(json.dumps({
+                "case_gold_chunk_keys": {"refund-arrival-001": [gold_key]},
+                "chunk_content_sha256": {gold_key: hashlib.sha256(b"fake refund chunk").hexdigest()},
+            }), encoding="utf-8")
             with mock.patch(
                 "evaluation.ragas_runner.run_ragas_evaluation",
                 side_effect=TypeError("metric object required"),
@@ -763,6 +901,7 @@ class RagasRunnerTests(unittest.TestCase):
                     evaluator_embeddings="embeddings",
                     run_id="failed-run",
                     top_k=2,
+                    retrieval_gold_path=gold_path,
                 )
 
             saved = json.loads((root / "output" / "failed-run.json").read_text(encoding="utf-8"))
