@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 from core.dashscope_embedding import DashScopeEmbeddingClient, EmbeddingUnavailable
+from core.resilience import call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -238,19 +239,23 @@ class IntentRecognizer:
 
         try:
             if trace is None:
-                resp = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=256,
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            else:
-                with trace.stage("intent.llm_recognize", model=self.model):
-                    resp = await self.client.messages.create(
+                resp = await call_llm(
+                    lambda: self.client.messages.create(
                         model=self.model,
                         max_tokens=256,
                         temperature=0.1,
                         messages=[{"role": "user", "content": prompt}],
+                    )
+                )
+            else:
+                with trace.stage("intent.llm_recognize", model=self.model):
+                    resp = await call_llm(
+                        lambda: self.client.messages.create(
+                            model=self.model,
+                            max_tokens=256,
+                            temperature=0.1,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
                     )
                     usage = _extract_usage_dict(resp)
                     if usage:
@@ -341,15 +346,19 @@ class IntentRecognizer:
         prompt = self._clean_text(prompt)
         try:
             if trace is None:
-                resp = await self.client.messages.create(
-                    model=self.model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
+                resp = await call_llm(
+                    lambda: self.client.messages.create(
+                        model=self.model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
                 )
             else:
                 with trace.stage("intent.extract_entities", model=self.model):
-                    resp = await self.client.messages.create(
-                        model=self.model, max_tokens=256, temperature=0.0,
-                        messages=[{"role": "user", "content": prompt}],
+                    resp = await call_llm(
+                        lambda: self.client.messages.create(
+                            model=self.model, max_tokens=256, temperature=0.0,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
                     )
                     usage = _extract_usage_dict(resp)
                     if usage:

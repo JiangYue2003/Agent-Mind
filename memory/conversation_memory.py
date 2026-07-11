@@ -24,6 +24,7 @@ import chromadb
 import redis
 from anthropic import AsyncAnthropic
 from core.dashscope_embedding import DashScopeEmbeddingClient, EmbeddingUnavailable
+from core.resilience import call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +183,11 @@ class MemoryManager:
         prompt = self._safe_text(prompt)
 
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=512, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await call_llm(
+                lambda: self._client.messages.create(
+                    model=self._model, max_tokens=512, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             raw = resp.content[0].text
             s, e = raw.find("{"), raw.rfind("}") + 1
@@ -262,9 +265,11 @@ class MemoryManager:
         text = self._safe_text("\n".join(f"{m.role.value}: {m.content}" for m in to_compress))
         prompt = self._safe_text(f"用 2-3 句话总结以下对话的关键信息：\n{text}")
         try:
-            resp = await self._client.messages.create(
-                model=self._model, max_tokens=256, temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            resp = await call_llm(
+                lambda: self._client.messages.create(
+                    model=self._model, max_tokens=256, temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             summary = self._safe_text(resp.content[0].text).strip()
         except Exception:

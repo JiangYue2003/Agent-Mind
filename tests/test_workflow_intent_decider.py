@@ -23,6 +23,38 @@ class _FakeClient:
 
 
 class WorkflowIntentDeciderTests(unittest.TestCase):
+    def test_retries_a_transient_llm_failure_before_using_workflow_fallback(self):
+        payload = {
+            "goal": "action",
+            "tools": ["refund_create"],
+            "confidence": 0.96,
+            "reason": "用户明确要求提交退款",
+        }
+
+        class FlakyMessages:
+            def __init__(self):
+                self.calls = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    raise OSError("temporary model network failure")
+                return SimpleNamespace(content=[SimpleNamespace(text=json.dumps(payload))])
+
+        client = SimpleNamespace(messages=FlakyMessages())
+        decider = WorkflowIntentDecider(api_key="test-key", client=client)
+
+        decision = asyncio.run(decider.decide(
+            message="请帮我申请退款",
+            intent=IntentCategory.BILLING,
+            entities={"order_id": ["ORD20250701001"]},
+            history=[],
+        ))
+
+        self.assertEqual(decision.mode, DecisionMode.ACTION)
+        self.assertEqual(decision.tools, ["refund_create"])
+        self.assertEqual(len(client.messages.calls), 2)
+
     def test_routes_general_delivery_question_to_knowledge_without_order_id(self):
         client = _FakeClient({
             "mode": "knowledge",

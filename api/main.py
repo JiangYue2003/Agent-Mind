@@ -5,6 +5,7 @@ EchoMind 智能客服系统 — FastAPI 入口
 所有核心组件在 lifespan 中初始化，通过环境变量配置。
 """
 import asyncio
+import hashlib
 import logging
 import os
 import pathlib
@@ -62,6 +63,7 @@ _skill_store = None
 _skill_reload_task = None
 _mock_handoff_records: List[Dict[str, Any]] = []
 _mock_refund_records: Dict[str, Dict[str, Any]] = {}
+_mock_idempotency_records: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
 
 _MOCK_ORDER_DATA: Dict[str, Dict[str, Any]] = {
     "ORD20250701001": {
@@ -414,6 +416,7 @@ class ChatRequest(BaseModel):
     message:     str
     user_id:     str = "anonymous"
     conv_id:     Optional[str] = None
+    operation_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -615,34 +618,65 @@ async def chat(req: ChatRequest):
                 if execution_result.context_blocks:
                     context_parts.extend(execution_result.context_blocks)
 
-                full_context = "\n\n".join(part for part in context_parts if part)
-
-                orch_req = OrcReq(
-                    message=req.message,
-                    user_id=req.user_id,
-                    conv_id=conv_id,
-                    context=full_context,
-                    history=history,
-                    intent=intent_result.intent if intent_result else None,
-                    urgency=intent_result.urgency if intent_result else None,
-                )
-
-                # 3. 执行
-                with trace.stage("orchestrator.run"):
-                    result = await _run_planned_orchestrator(
-                        orch_req,
-                        action_plan,
-                        trace=trace,
-                        skill_snapshot=skill_snapshot,
+                if execution_result.handoff_required:
+                    failure_handoff_key = _make_idempotency_key(
+                        operation="failure_handoff",
+                        command_id=str(req.operation_id or conv_id),
+                        user_id=req.user_id,
+                        resource_id=conv_id,
                     )
-                response_text = result.response
-                if action_plan.follow_up_prompt:
-                    response_text = f"{response_text.rstrip()}\n\n{action_plan.follow_up_prompt}"
-                if not action_plan.need_handoff:
-                    response_agent_type = result.agent_type
-                response_intent = result.intent
-                response_escalated = result.escalated or action_plan.need_handoff
-                response_latency_ms = result.latency_ms
+                    handoff_result = await _maybe_handoff(
+                        req,
+                        conv_id,
+                        mem_ctx,
+                        intent_result,
+                        None,
+                        force=True,
+                        trace=trace,
+                        idempotency_key=failure_handoff_key,
+                    )
+                    response_escalated = True
+                    if handoff_result and str(handoff_result.get("status", "")).lower() != "failed":
+                        context_parts.append(_format_handoff_context(handoff_result))
+                    else:
+                        context_parts.append(
+                            "[工作流执行状态]\n"
+                            "- 退款请求的最终状态暂时无法确认，请不要重复提交。"
+                        )
+
+                if execution_result.user_input_required:
+                    response_text = "当前操作状态暂时无法确认，请不要重复提交；请稍后重试或联系人工客服。"
+                    response_escalated = response_escalated or action_plan.need_handoff
+                    response_latency_ms = (time.monotonic() - t0) * 1000
+                else:
+                    full_context = "\n\n".join(part for part in context_parts if part)
+
+                    orch_req = OrcReq(
+                        message=req.message,
+                        user_id=req.user_id,
+                        conv_id=conv_id,
+                        context=full_context,
+                        history=history,
+                        intent=intent_result.intent if intent_result else None,
+                        urgency=intent_result.urgency if intent_result else None,
+                    )
+
+                    # 3. 执行
+                    with trace.stage("orchestrator.run"):
+                        result = await _run_planned_orchestrator(
+                            orch_req,
+                            action_plan,
+                            trace=trace,
+                            skill_snapshot=skill_snapshot,
+                        )
+                    response_text = result.response
+                    if action_plan.follow_up_prompt:
+                        response_text = f"{response_text.rstrip()}\n\n{action_plan.follow_up_prompt}"
+                    if not action_plan.need_handoff:
+                        response_agent_type = result.agent_type
+                    response_intent = result.intent
+                    response_escalated = response_escalated or result.escalated or action_plan.need_handoff
+                    response_latency_ms = result.latency_ms
 
             # 4. 写入记忆
             with trace.stage("memory.write"):
@@ -832,6 +866,7 @@ async def _execute_workflow_plan(
         "intent_result": intent_result,
         "trace": trace,
         "entities": getattr(intent_result, "entities", {}) if intent_result else {},
+        "idempotency_keys": _workflow_idempotency_keys(plan, req, conv_id, intent_result),
     }
     if trace is None:
         result = await executor.execute(plan, runtime=runtime)
@@ -842,6 +877,8 @@ async def _execute_workflow_plan(
             trace._stages[-1].meta["evidence_keys"] = list(result.evidence_store.items.keys())
             trace._stages[-1].meta["failed_actions"] = list(result.failed_actions)
             trace._stages[-1].meta["degraded"] = result.degraded
+            trace._stages[-1].meta["handoff_required"] = result.handoff_required
+            trace._stages[-1].meta["user_input_required"] = result.user_input_required
     return result
 
 
@@ -870,14 +907,15 @@ def _build_workflow_tool_registry():
         )
 
     async def _lookup_order(action, runtime, evidence_store):
-        payload = await _maybe_lookup_order(
-            runtime["req"],
-            runtime["intent_result"],
-            force=True,
-            trace=runtime.get("trace"),
+        payload = _require_successful_tool_payload(
+            await _maybe_lookup_order(
+                runtime["req"],
+                runtime["intent_result"],
+                force=True,
+                trace=runtime.get("trace"),
+            ),
+            "order_lookup",
         )
-        if payload is None:
-            return None
         return EvidenceItem(
             key=action.output_key or "order.snapshot",
             source="order_lookup",
@@ -887,14 +925,15 @@ def _build_workflow_tool_registry():
         )
 
     async def _track_shipment(action, runtime, evidence_store):
-        payload = await _maybe_track_shipment(
-            runtime["req"],
-            runtime["intent_result"],
-            force=True,
-            trace=runtime.get("trace"),
+        payload = _require_successful_tool_payload(
+            await _maybe_track_shipment(
+                runtime["req"],
+                runtime["intent_result"],
+                force=True,
+                trace=runtime.get("trace"),
+            ),
+            "shipment_track",
         )
-        if payload is None:
-            return None
         return EvidenceItem(
             key=action.output_key or "shipment.snapshot",
             source="shipment_track",
@@ -904,14 +943,16 @@ def _build_workflow_tool_registry():
         )
 
     async def _create_refund(action, runtime, evidence_store):
-        payload = await _maybe_create_refund(
-            runtime["req"],
-            runtime["intent_result"],
-            force=True,
-            trace=runtime.get("trace"),
+        payload = _require_successful_tool_payload(
+            await _maybe_create_refund(
+                runtime["req"],
+                runtime["intent_result"],
+                force=True,
+                trace=runtime.get("trace"),
+                idempotency_key=(runtime.get("idempotency_keys") or {}).get(action.id, ""),
+            ),
+            "refund_create",
         )
-        if payload is None:
-            return None
         return EvidenceItem(
             key=action.output_key or "refund.result",
             source="refund_create",
@@ -922,17 +963,19 @@ def _build_workflow_tool_registry():
 
     async def _create_handoff(action, runtime, evidence_store):
         order_item = evidence_store.get("order.snapshot")
-        payload = await _maybe_handoff(
-            runtime["req"],
-            runtime["conv_id"],
-            runtime["mem_ctx"],
-            runtime["intent_result"],
-            order_item.value if order_item else None,
-            force=True,
-            trace=runtime.get("trace"),
+        payload = _require_successful_tool_payload(
+            await _maybe_handoff(
+                runtime["req"],
+                runtime["conv_id"],
+                runtime["mem_ctx"],
+                runtime["intent_result"],
+                order_item.value if order_item else None,
+                force=True,
+                trace=runtime.get("trace"),
+                idempotency_key=(runtime.get("idempotency_keys") or {}).get(action.id, ""),
+            ),
+            "human_handoff",
         )
-        if payload is None:
-            return None
         return EvidenceItem(
             key=action.output_key or "handoff.result",
             source="human_handoff",
@@ -1127,7 +1170,21 @@ async def _build_tool_context(
         skipped_tools.append("order_lookup")
 
     if plan is not None and getattr(plan, "need_handoff", False):
-        handoff_result = await _maybe_handoff(req, conv_id, mem_ctx, intent_result, order_snapshot, force=True, trace=trace)
+        handoff_result = await _maybe_handoff(
+            req,
+            conv_id,
+            mem_ctx,
+            intent_result,
+            order_snapshot,
+            force=True,
+            trace=trace,
+            idempotency_key=_make_idempotency_key(
+                operation="create_handoff",
+                command_id=str(req.operation_id or conv_id),
+                user_id=req.user_id,
+                resource_id=conv_id,
+            ),
+        )
         if handoff_result is not None:
             called_tools.append("human_handoff")
             sections.append(_format_handoff_context(handoff_result))
@@ -1172,6 +1229,46 @@ def _extract_refund_reason(message: str) -> str:
     return ""
 
 
+def _make_idempotency_key(
+    *,
+    operation: str,
+    command_id: str,
+    user_id: str,
+    resource_id: str,
+) -> str:
+    material = "\n".join([operation, command_id, user_id, resource_id]).encode("utf-8")
+    digest = hashlib.sha256(material).hexdigest()
+    return f"echomind-{operation}-v1-{digest}"
+
+
+def _workflow_idempotency_keys(
+    plan: Any,
+    req: ChatRequest,
+    conv_id: str,
+    intent_result: Any,
+) -> Dict[str, str]:
+    command_id = str(req.operation_id or conv_id).strip()
+    if not command_id:
+        return {}
+    keys: Dict[str, str] = {}
+    order_id = _extract_order_id(intent_result)
+    for action in getattr(plan, "actions", []):
+        action_type = getattr(getattr(action, "type", None), "value", "")
+        if action_type == "create_refund":
+            resource_id = order_id or "refund"
+        elif action_type == "create_handoff":
+            resource_id = conv_id
+        else:
+            continue
+        keys[action.id] = _make_idempotency_key(
+            operation=action_type,
+            command_id=command_id,
+            user_id=req.user_id,
+            resource_id=resource_id,
+        )
+    return keys
+
+
 def _looks_like_shipment_query(message: str) -> bool:
     msg = (message or "").lower()
     keywords = ["物流", "快递", "配送", "发货", "运输", "tracking", "shipment", "delivery"]
@@ -1203,6 +1300,14 @@ async def _call_business_tool(
     if not result.success or not isinstance(result.data, dict):
         return {"status": "failed", "error": result.error or "tool_failed", **params}
     return result.data
+
+
+def _require_successful_tool_payload(payload: Optional[Dict[str, Any]], tool_name: str) -> Dict[str, Any]:
+    if payload is None:
+        raise RuntimeError(f"{tool_name} 未返回结果")
+    if str(payload.get("status", "")).strip().lower() == "failed":
+        raise RuntimeError(str(payload.get("error", "tool_failed")))
+    return payload
 
 
 async def _maybe_lookup_order(
@@ -1246,6 +1351,7 @@ async def _maybe_create_refund(
     intent_result: Any,
     force: bool = False,
     trace: Any = None,
+    idempotency_key: str = "",
 ) -> Optional[Dict[str, Any]]:
     order_id = _extract_order_id(intent_result)
     if not order_id:
@@ -1258,6 +1364,7 @@ async def _maybe_create_refund(
             "user_id": req.user_id,
             "order_id": order_id,
             "reason": _extract_refund_reason(req.message),
+            "idempotency_key": idempotency_key,
         },
         trace=trace,
     )
@@ -1280,6 +1387,7 @@ async def _maybe_handoff(
     order_snapshot: Optional[Dict[str, Any]],
     force: bool = False,
     trace: Any = None,
+    idempotency_key: str = "",
 ) -> Optional[Dict[str, Any]]:
     if not force and not _should_handoff(req.message, intent_result):
         return None
@@ -1303,6 +1411,7 @@ async def _maybe_handoff(
         "user_profile": getattr(mem_ctx, "user_profile", {}) or {},
         "order_snapshot": order_snapshot or {},
         "knowledge_context": [],
+        "idempotency_key": idempotency_key,
     }
 
     try:
@@ -1552,6 +1661,34 @@ def _get_owned_mock_record(store: Dict[str, Dict[str, Any]], resource_id: str, u
     return record
 
 
+def _mock_idempotency_replay(
+    operation: str,
+    idempotency_key: Optional[str],
+    request_payload: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    key = str(idempotency_key or "").strip()
+    if not key:
+        return None
+    existing = _mock_idempotency_records.get(f"{operation}:{key}")
+    if existing is None:
+        return None
+    expected_payload, result = existing
+    if expected_payload != request_payload:
+        raise HTTPException(409, "幂等键已用于不同请求")
+    return dict(result)
+
+
+def _remember_mock_idempotency(
+    operation: str,
+    idempotency_key: Optional[str],
+    request_payload: Dict[str, Any],
+    result: Dict[str, Any],
+) -> None:
+    key = str(idempotency_key or "").strip()
+    if key:
+        _mock_idempotency_records[f"{operation}:{key}"] = (dict(request_payload), dict(result))
+
+
 @app.get("/mock/external/orders/{order_id}", tags=["Mock External"])
 async def mock_external_order_lookup(order_id: str, user_id: str):
     record = _get_owned_mock_record(_MOCK_ORDER_DATA, order_id, user_id)
@@ -1571,11 +1708,20 @@ class MockRefundCreateInput(BaseModel):
 
 
 @app.post("/mock/external/refunds", tags=["Mock External"])
-async def mock_external_refund_create(body: MockRefundCreateInput):
+async def mock_external_refund_create(
+    body: MockRefundCreateInput,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     order_record = _get_owned_mock_record(_MOCK_ORDER_DATA, body.order_id, body.user_id)
+    request_payload = body.model_dump()
+    replay = _mock_idempotency_replay("refund", idempotency_key, request_payload)
+    if replay is not None:
+        return replay
     existing = _mock_refund_records.get(body.order_id)
     if existing is not None and existing.get("user_id") == body.user_id:
-        return dict(existing)
+        result = dict(existing)
+        _remember_mock_idempotency("refund", idempotency_key, request_payload, result)
+        return result
 
     submitted_at = datetime.now(timezone.utc).astimezone().isoformat()
     record = {
@@ -1592,7 +1738,9 @@ async def mock_external_refund_create(body: MockRefundCreateInput):
 
     order_record["refund_status"] = "退款申请已提交"
     order_record["updated_at"] = submitted_at
-    return dict(record)
+    result = dict(record)
+    _remember_mock_idempotency("refund", idempotency_key, request_payload, result)
+    return result
 
 
 class MockHandoffInput(BaseModel):
@@ -1610,19 +1758,28 @@ class MockHandoffInput(BaseModel):
 
 
 @app.post("/mock/external/handoffs", tags=["Mock External"])
-async def mock_external_handoff(body: MockHandoffInput):
+async def mock_external_handoff(
+    body: MockHandoffInput,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    request_payload = body.model_dump()
+    replay = _mock_idempotency_replay("handoff", idempotency_key, request_payload)
+    if replay is not None:
+        return replay
     record = body.model_dump()
     record["handoff_id"] = f"HD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
     record["queue"] = "general_support"
     record["status"] = "created"
     record["eta_minutes"] = 8
     _mock_handoff_records.append(record)
-    return {
+    result = {
         "handoff_id": record["handoff_id"],
         "queue": record["queue"],
         "status": record["status"],
         "eta_minutes": record["eta_minutes"],
     }
+    _remember_mock_idempotency("handoff", idempotency_key, request_payload, result)
+    return result
 
 
 @app.get("/metrics")

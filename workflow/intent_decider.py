@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+from core.resilience import call_llm
 from core.intent_recognizer import IntentCategory
 from workflow.tool_schema import required_slots_for_tools
 
@@ -90,11 +91,13 @@ class WorkflowIntentDecider:
         order_id = self._resolve_order_id(entities, history)
         prompt = self._build_prompt(message, intent, order_id, history)
         try:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=320,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
+            response = await call_llm(
+                lambda: self.client.messages.create(
+                    model=self.model,
+                    max_tokens=320,
+                    temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
             )
             raw = response.content[0].text
             payload = self._parse_json(raw)

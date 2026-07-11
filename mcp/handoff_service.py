@@ -31,6 +31,7 @@ class HumanHandoffService:
             "order_snapshot": dict(params.get("order_snapshot") or {}),
             "knowledge_context": list(params.get("knowledge_context") or []),
         }
+        idempotency_key = str(params.get("idempotency_key", "") or "").strip()
         if not payload["user_id"]:
             raise ValueError("缺少 user_id")
         if not payload["conv_id"]:
@@ -43,6 +44,7 @@ class HumanHandoffService:
             timeout=self._timeout_s,
             transport=self._transport,
         ) as client:
-            response = await client.post("/mock/external/handoffs", json=payload)
+            headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+            response = await client.post("/mock/external/handoffs", json=payload, headers=headers)
             response.raise_for_status()
             return response.json()

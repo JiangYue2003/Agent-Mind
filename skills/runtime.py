@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -79,7 +80,7 @@ class SkillRuntime:
         self._known_tools = frozenset(str(tool) for tool in known_tools)
         self._lock = threading.Lock()
         self._snapshot = SkillSnapshot(generation=0, skills=MappingProxyType({}))
-        self._fingerprint: Tuple[Tuple[str, int, int], ...] | None = None
+        self._fingerprint: Tuple[Tuple[str, int, int, str], ...] | None = None
         self._last_refresh_at: str | None = None
         self.last_errors: Tuple[str, ...] = ()
 
@@ -193,8 +194,8 @@ class SkillRuntime:
         packages = sorted(root.glob("*/*/skill.json"))
         return [self._parse_package(manifest_path, source=source) for manifest_path in packages]
 
-    def _source_fingerprint(self) -> Tuple[Tuple[str, int, int], ...]:
-        entries: List[Tuple[str, int, int]] = []
+    def _source_fingerprint(self) -> Tuple[Tuple[str, int, int, str], ...]:
+        entries: List[Tuple[str, int, int, str]] = []
         for root in (self.catalog_dir, self.published_dir):
             if not root.exists():
                 continue
@@ -202,7 +203,8 @@ class SkillRuntime:
                 if not path.is_file() or any(part.startswith(".") for part in path.relative_to(root).parts):
                     continue
                 stat = path.stat()
-                entries.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size))
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                entries.append((str(path.resolve()), stat.st_mtime_ns, stat.st_size, digest))
         return tuple(sorted(entries))
 
     def _parse_package(self, manifest_path: Path, *, source: str) -> SkillDefinition:

@@ -32,6 +32,20 @@ class WorkflowDagTests(unittest.TestCase):
         self.assertEqual(action_types[-1], "synthesize_answer")
         self.assertEqual(plan.route_plan.primary_agent.value, "billing")
 
+    def test_planner_assigns_resilience_policies_by_action_semantics(self):
+        from workflow.action_models import FailurePolicy
+
+        retrieve = self.planner._retrieve_policy_action("a1", "knowledge")
+        lookup = self.planner._lookup_order_action("a2")
+        refund = self.planner._create_refund_action("a3")
+
+        self.assertEqual(retrieve.retry_limit, 2)
+        self.assertEqual(retrieve.failure_policy, FailurePolicy.CONTINUE)
+        self.assertEqual(lookup.timeout_ms, 6_000)
+        self.assertEqual(lookup.failure_policy, FailurePolicy.CONTINUE)
+        self.assertEqual(refund.retry_limit, 1)
+        self.assertEqual(refund.failure_policy, FailurePolicy.HANDOFF)
+
     def test_action_executor_runs_ready_nodes_and_writes_evidence_store(self):
         from workflow.action_executor import ActionExecutor
         from workflow.action_models import (
@@ -127,6 +141,156 @@ class WorkflowDagTests(unittest.TestCase):
         joined_context = "\n".join(result.context_blocks)
         self.assertIn("[知识库检索结果]", joined_context)
         self.assertIn("[order_lookup]", joined_context)
+
+    def test_action_executor_enforces_the_action_total_timeout_budget(self):
+        from workflow.action_executor import ActionExecutor
+        from workflow.action_models import ActionItem, ActionType, WorkflowPlan
+        from workflow.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+
+        async def _slow_lookup(action, runtime, evidence_store):
+            await asyncio.sleep(0.03)
+
+        registry.register(ActionType.LOOKUP_ORDER, _slow_lookup)
+        plan = WorkflowPlan(
+            complexity="single_domain",
+            primary_intent="query",
+            actions=[ActionItem(
+                id="a1",
+                type=ActionType.LOOKUP_ORDER,
+                objective="查询订单",
+                domain="orders",
+                timeout_ms=10,
+                retry_limit=0,
+            )],
+        )
+
+        result = asyncio.run(ActionExecutor(registry).execute(plan, runtime={}))
+
+        self.assertEqual(result.action_statuses["a1"], "failed")
+        self.assertIn("a1", result.failed_actions)
+
+    def test_action_executor_does_not_retry_a_write_without_an_idempotency_key(self):
+        from workflow.action_executor import ActionExecutor
+        from workflow.action_models import ActionItem, ActionType, WorkflowPlan
+        from workflow.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        calls = 0
+
+        async def _refund_create(action, runtime, evidence_store):
+            nonlocal calls
+            calls += 1
+            raise OSError("after-sales service unavailable")
+
+        registry.register(ActionType.CREATE_REFUND, _refund_create)
+        plan = WorkflowPlan(
+            complexity="single_domain",
+            primary_intent="billing",
+            actions=[ActionItem(
+                id="a1",
+                type=ActionType.CREATE_REFUND,
+                objective="提交退款",
+                domain="billing",
+                timeout_ms=1_000,
+                retry_limit=2,
+            )],
+        )
+
+        result = asyncio.run(ActionExecutor(registry).execute(plan, runtime={}))
+
+        self.assertEqual(result.action_statuses["a1"], "failed")
+        self.assertEqual(calls, 1)
+
+    def test_action_executor_fail_fast_policy_blocks_remaining_actions(self):
+        from workflow.action_executor import ActionExecutor
+        from workflow.action_models import (
+            ActionItem,
+            ActionType,
+            FailurePolicy,
+            StopConditions,
+            WorkflowPlan,
+        )
+        from workflow.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+        follow_up_calls = 0
+
+        async def _failed_lookup(action, runtime, evidence_store):
+            raise RuntimeError("order service rejected the request")
+
+        async def _follow_up(action, runtime, evidence_store):
+            nonlocal follow_up_calls
+            follow_up_calls += 1
+
+        registry.register(ActionType.LOOKUP_ORDER, _failed_lookup)
+        registry.register(ActionType.SYNTHESIZE_ANSWER, _follow_up)
+        plan = WorkflowPlan(
+            complexity="single_domain",
+            primary_intent="query",
+            actions=[
+                ActionItem(
+                    id="a1",
+                    type=ActionType.LOOKUP_ORDER,
+                    objective="查询订单",
+                    domain="orders",
+                    retry_limit=0,
+                    failure_policy=FailurePolicy.FAIL_FAST,
+                ),
+                ActionItem(
+                    id="a2",
+                    type=ActionType.SYNTHESIZE_ANSWER,
+                    objective="生成答复",
+                    domain="response",
+                ),
+            ],
+            stop_conditions=StopConditions(max_failures=2),
+        )
+
+        result = asyncio.run(ActionExecutor(registry).execute(plan, runtime={}))
+
+        self.assertTrue(result.degraded)
+        self.assertEqual(result.action_statuses["a1"], "failed")
+        self.assertEqual(result.action_statuses["a2"], "blocked")
+        self.assertEqual(follow_up_calls, 0)
+
+    def test_action_executor_handoff_policy_requests_escalation_and_blocks_remaining_actions(self):
+        from workflow.action_executor import ActionExecutor
+        from workflow.action_models import ActionItem, ActionType, FailurePolicy, WorkflowPlan
+        from workflow.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()
+
+        async def _failed_refund(action, runtime, evidence_store):
+            raise OSError("after-sales result is unknown")
+
+        registry.register(ActionType.CREATE_REFUND, _failed_refund)
+        plan = WorkflowPlan(
+            complexity="single_domain",
+            primary_intent="billing",
+            actions=[
+                ActionItem(
+                    id="a1",
+                    type=ActionType.CREATE_REFUND,
+                    objective="提交退款",
+                    domain="billing",
+                    retry_limit=0,
+                    failure_policy=FailurePolicy.HANDOFF,
+                ),
+                ActionItem(
+                    id="a2",
+                    type=ActionType.SYNTHESIZE_ANSWER,
+                    objective="生成答复",
+                    domain="response",
+                ),
+            ],
+        )
+
+        result = asyncio.run(ActionExecutor(registry).execute(plan, runtime={}))
+
+        self.assertTrue(result.handoff_required)
+        self.assertEqual(result.action_statuses["a2"], "blocked")
 
 
 if __name__ == "__main__":

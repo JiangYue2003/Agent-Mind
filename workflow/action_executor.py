@@ -4,8 +4,10 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
+from core.resilience import RetryPolicy, run_with_budget
 from workflow.action_models import (
     ActionItem,
+    FailurePolicy,
     ActionStatus,
     ActionType,
     EvidenceItem,
@@ -14,6 +16,9 @@ from workflow.action_models import (
     WorkflowPlan,
 )
 from workflow.tool_registry import ToolRegistry
+
+
+_WRITE_ACTION_TYPES = {ActionType.CREATE_REFUND, ActionType.CREATE_HANDOFF}
 
 
 @dataclass
@@ -25,6 +30,8 @@ class ExecutionResult:
     knowledge_used: bool = False
     degraded: bool = False
     failed_actions: List[str] = field(default_factory=list)
+    handoff_required: bool = False
+    user_input_required: bool = False
 
 
 class ActionExecutor:
@@ -38,6 +45,8 @@ class ActionExecutor:
         failures = 0
         executed = 0
         degraded = False
+        handoff_required = False
+        user_input_required = False
 
         while self._has_pending(statuses):
             ready = [
@@ -63,6 +72,7 @@ class ActionExecutor:
                     break
 
                 outcomes = await self._run_group(group, runtime, evidence_store)
+                terminal_policy: FailurePolicy | None = None
                 for action, outcome in zip(group, outcomes):
                     statuses[action.id] = outcome["status"]
                     for item in outcome["evidence_items"]:
@@ -70,7 +80,18 @@ class ActionExecutor:
                     if outcome["status"] == ActionStatus.FAILED.value:
                         failures += 1
                         failed_actions.append(action.id)
+                        if action.failure_policy != FailurePolicy.CONTINUE:
+                            terminal_policy = action.failure_policy
                     executed += 1
+
+                if terminal_policy is not None:
+                    degraded = True
+                    handoff_required = handoff_required or terminal_policy == FailurePolicy.HANDOFF
+                    user_input_required = user_input_required or terminal_policy == FailurePolicy.ASK_USER
+                    for action in plan.actions:
+                        if statuses[action.id] == ActionStatus.PENDING.value:
+                            statuses[action.id] = ActionStatus.BLOCKED.value
+                    break
 
                 if failures > plan.stop_conditions.max_failures:
                     degraded = True
@@ -90,6 +111,8 @@ class ActionExecutor:
             knowledge_used=any(item.source == "knowledge_search" for item in evidence_store.values()),
             degraded=degraded,
             failed_actions=failed_actions,
+            handoff_required=handoff_required,
+            user_input_required=user_input_required,
         )
 
     async def _run_group(
@@ -109,19 +132,24 @@ class ActionExecutor:
         evidence_store: EvidenceStore,
     ) -> Dict[str, Any]:
         trace = self._runtime_get(runtime, "trace")
-        attempts = max(action.retry_limit, 0) + 1
-        last_error = ""
-        for _ in range(attempts):
-            try:
-                if trace is None:
-                    raw = await self._registry.execute(action, runtime, evidence_store)
-                else:
-                    with trace.stage(f"workflow.action.{action.id}", action_type=action.type.value):
-                        raw = await self._registry.execute(action, runtime, evidence_store)
-                items = self._normalize_evidence(raw)
-                return {"status": ActionStatus.SUCCEEDED.value, "evidence_items": items}
-            except Exception as ex:  # pragma: no cover - failures are asserted by caller state
-                last_error = str(ex)
+        async def execute_once():
+            if trace is None:
+                return await self._registry.execute(action, runtime, evidence_store)
+            with trace.stage(f"workflow.action.{action.id}", action_type=action.type.value):
+                return await self._registry.execute(action, runtime, evidence_store)
+
+        try:
+            result = await run_with_budget(
+                execute_once,
+                policy=RetryPolicy(
+                    timeout_ms=action.timeout_ms,
+                    retry_limit=self._retry_limit_for(action, runtime),
+                ),
+            )
+            items = self._normalize_evidence(result.value)
+            return {"status": ActionStatus.SUCCEEDED.value, "evidence_items": items}
+        except Exception as ex:  # pragma: no cover - failures are asserted by caller state
+            last_error = str(ex) or type(ex).__name__
         return {
             "status": ActionStatus.FAILED.value,
             "evidence_items": [
@@ -194,6 +222,14 @@ class ActionExecutor:
 
     def _has_pending(self, statuses: Dict[str, str]) -> bool:
         return any(status == ActionStatus.PENDING.value for status in statuses.values())
+
+    def _retry_limit_for(self, action: ActionItem, runtime: Any) -> int:
+        if action.type not in _WRITE_ACTION_TYPES:
+            return max(action.retry_limit, 0)
+        idempotency_keys = self._runtime_get(runtime, "idempotency_keys", {}) or {}
+        if isinstance(idempotency_keys, dict) and str(idempotency_keys.get(action.id, "")).strip():
+            return max(action.retry_limit, 0)
+        return 0
 
     @staticmethod
     def _runtime_get(runtime: Any, key: str, default: Any = None) -> Any:

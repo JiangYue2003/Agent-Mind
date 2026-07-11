@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
 
+from core.resilience import call_llm
+
 logger = logging.getLogger(__name__)
 
 
@@ -309,15 +311,19 @@ class MCPToolManager:
         prompt = self._clean_text(prompt)
         try:
             if trace is None:
-                resp = await self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.3,
-                    messages=[{"role": "user", "content": prompt}],
+                resp = await call_llm(
+                    lambda: self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.3,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
                 )
             else:
                 with trace.stage("tool_manager.rewrite_query_llm", model=self._model):
-                    resp = await self._client.messages.create(
-                        model=self._model, max_tokens=256, temperature=0.3,
-                        messages=[{"role": "user", "content": prompt}],
+                    resp = await call_llm(
+                        lambda: self._client.messages.create(
+                            model=self._model, max_tokens=256, temperature=0.3,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
                     )
                     usage = _extract_usage_dict(resp)
                     if usage:
@@ -489,15 +495,19 @@ class MCPToolManager:
 
         try:
             if trace is None:
-                resp = await self._client.messages.create(
-                    model=self._model, max_tokens=256, temperature=0.0,
-                    messages=[{"role": "user", "content": prompt}],
+                resp = await call_llm(
+                    lambda: self._client.messages.create(
+                        model=self._model, max_tokens=256, temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
                 )
             else:
                 with trace.stage("tool_manager.outer_rerank_llm", model=self._model):
-                    resp = await self._client.messages.create(
-                        model=self._model, max_tokens=256, temperature=0.0,
-                        messages=[{"role": "user", "content": prompt}],
+                    resp = await call_llm(
+                        lambda: self._client.messages.create(
+                            model=self._model, max_tokens=256, temperature=0.0,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
                     )
                     usage = _extract_usage_dict(resp)
                     if usage:

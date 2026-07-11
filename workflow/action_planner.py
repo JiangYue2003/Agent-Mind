@@ -8,6 +8,7 @@ from workflow.action_models import (
     ActionType,
     AgentRole,
     ComplexityLevel,
+    FailurePolicy,
     MergeMode,
     RoutePlan,
     StopConditions,
@@ -90,6 +91,9 @@ class ActionPlanner:
                     tool_name="human_handoff",
                     input_keys=["order.snapshot"] if handoff_depends else [],
                     output_key="handoff.result",
+                    timeout_ms=6_000,
+                    retry_limit=1,
+                    failure_policy=FailurePolicy.ASK_USER,
                     reason=assessment.reason or "用户明确要求转人工",
                 )
             )
@@ -413,6 +417,9 @@ class ActionPlanner:
             can_parallel=True,
             tool_name="knowledge_search",
             output_key="knowledge.policy",
+            timeout_ms=8_000,
+            retry_limit=2,
+            failure_policy=FailurePolicy.CONTINUE,
         )
 
     def _lookup_order_action(self, action_id: str) -> ActionItem:
@@ -425,6 +432,9 @@ class ActionPlanner:
             can_parallel=True,
             tool_name="order_lookup",
             output_key="order.snapshot",
+            timeout_ms=6_000,
+            retry_limit=2,
+            failure_policy=FailurePolicy.CONTINUE,
         )
 
     def _track_shipment_action(self, action_id: str) -> ActionItem:
@@ -437,6 +447,9 @@ class ActionPlanner:
             can_parallel=True,
             tool_name="shipment_track",
             output_key="shipment.snapshot",
+            timeout_ms=6_000,
+            retry_limit=2,
+            failure_policy=FailurePolicy.CONTINUE,
         )
 
     def _create_refund_action(self, action_id: str) -> ActionItem:
@@ -448,6 +461,9 @@ class ActionPlanner:
             required_slots=required_slots_for_tools(["refund_create"]),
             tool_name="refund_create",
             output_key="refund.result",
+            timeout_ms=8_000,
+            retry_limit=1,
+            failure_policy=FailurePolicy.HANDOFF,
         )
 
     def _synthesize_action(self, action_id: str, depends_on: List[str], multi_agent: bool) -> ActionItem:

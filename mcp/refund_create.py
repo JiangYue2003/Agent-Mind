@@ -25,6 +25,7 @@ class RefundCreateService:
             "order_id": str(params.get("order_id", "") or "").strip(),
             "reason": str(params.get("reason", "") or "").strip(),
         }
+        idempotency_key = str(params.get("idempotency_key", "") or "").strip()
         if not payload["user_id"]:
             raise ValueError("缺少 user_id")
         if not payload["order_id"]:
@@ -35,6 +36,7 @@ class RefundCreateService:
             timeout=self._timeout_s,
             transport=self._transport,
         ) as client:
-            response = await client.post("/mock/external/refunds", json=payload)
+            headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+            response = await client.post("/mock/external/refunds", json=payload, headers=headers)
             raise_for_protected_resource(response, "退款申请")
             return response.json()

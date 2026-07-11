@@ -102,6 +102,32 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "submitted")
         self.assertTrue(result["refund_id"].startswith("RF"))
 
+    async def test_refund_create_forwards_the_idempotency_key_to_after_sales(self):
+        from mcp.refund_create import RefundCreateService
+
+        captured = {}
+
+        def handler(request):
+            captured["idempotency_key"] = request.headers.get("Idempotency-Key")
+            return httpx.Response(200, json={"status": "submitted"})
+
+        service = RefundCreateService(
+            base_url="https://after-sales.example",
+            transport=httpx.MockTransport(handler),
+        )
+
+        await service.create_handler(
+            {
+                "user_id": "u1001",
+                "order_id": "ORD20250701001",
+                "reason": "买错了",
+                "idempotency_key": "refund-command-1",
+            },
+            context=None,
+        )
+
+        self.assertEqual(captured["idempotency_key"], "refund-command-1")
+
     async def test_human_handoff_posts_context_to_mock_external_system(self):
         from mcp.handoff_service import HumanHandoffService
 
@@ -139,6 +165,26 @@ class CustomerServiceToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(latest["conv_id"], "c456")
         self.assertEqual(latest["order_snapshot"]["order_id"], "ORD20250701001")
         self.assertIn("我的订单怎么还没到", latest["latest_message"])
+
+    async def test_human_handoff_replays_the_original_result_for_the_same_idempotency_key(self):
+        from mcp.handoff_service import HumanHandoffService
+
+        client = TestClient(api_main.app)
+        transport = httpx.ASGITransport(app=api_main.app)
+        service = HumanHandoffService(base_url=str(client.base_url), transport=transport)
+        payload = {
+            "user_id": "u-idempotency",
+            "conv_id": "c-idempotency",
+            "latest_message": "请转人工",
+            "idempotency_key": "handoff-command-1",
+        }
+        before = len(api_main._mock_handoff_records)
+
+        first = await service.handoff_handler(payload, context=None)
+        replay = await service.handoff_handler(payload, context=None)
+
+        self.assertEqual(first["handoff_id"], replay["handoff_id"])
+        self.assertEqual(len(api_main._mock_handoff_records), before + 1)
 
     async def test_tool_manager_can_register_order_and_handoff_tools(self):
         from mcp.handoff_service import HumanHandoffService

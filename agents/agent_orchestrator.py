@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.resilience import call_llm
 
 logger = logging.getLogger(__name__)
 
@@ -157,19 +158,23 @@ class BaseAgent:
         trace = (context or {}).get("trace")
         system_prompt = self._system_prompt_for(context)
         if trace is None:
-            resp = await self._client.messages.create(
-                model=self._model,
-                max_tokens=450,
-                system=system_prompt,
-                messages=messages,
-            )
-        else:
-            with trace.stage(f"agent.llm_call.{self.agent_type.value}", model=self._model):
-                resp = await self._client.messages.create(
+            resp = await call_llm(
+                lambda: self._client.messages.create(
                     model=self._model,
                     max_tokens=450,
                     system=system_prompt,
                     messages=messages,
+                )
+            )
+        else:
+            with trace.stage(f"agent.llm_call.{self.agent_type.value}", model=self._model):
+                resp = await call_llm(
+                    lambda: self._client.messages.create(
+                        model=self._model,
+                        max_tokens=450,
+                        system=system_prompt,
+                        messages=messages,
+                    )
                 )
                 usage = _extract_usage_dict(resp)
                 if usage:
