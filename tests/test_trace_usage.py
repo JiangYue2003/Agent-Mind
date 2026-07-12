@@ -64,6 +64,45 @@ class _FakeIntentClient:
         self.messages = _FakeIntentMessages()
 
 
+class _FailingTextStream:
+    def __init__(self):
+        self._parts = iter(["半句"])
+        self._raised = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._parts)
+        except StopIteration:
+            if not self._raised:
+                self._raised = True
+                raise RuntimeError("stream failed")
+            raise StopAsyncIteration
+
+
+class _FailingStreamManager:
+    def __init__(self):
+        self.text_stream = _FailingTextStream()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FailingStreamMessages:
+    def stream(self, **kwargs):
+        return _FailingStreamManager()
+
+
+class _FailingStreamClient:
+    def __init__(self):
+        self.messages = _FailingStreamMessages()
+
+
 class _FakeRewriteResponse:
     def __init__(self):
         self.content = [_FakeContentBlock('["退款多久到账","退款几天能到"]')]
@@ -133,6 +172,21 @@ class TraceUsageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("先给出直接结论", call["system"])
         self.assertIn("不要补充", call["system"])
         self.assertIn("不是实时订单事实", call["system"])
+
+    async def test_streaming_agent_raises_on_midstream_failure(self):
+        agent = GeneralAgent(_FailingStreamClient(), "deepseek-chat")
+        req = Request(
+            message="退款多久到账",
+            user_id="u123",
+            conv_id="c123",
+            context="背景信息",
+        )
+        chunks = []
+
+        with self.assertRaises(RuntimeError):
+            await agent.handle_stream(req, lambda text: chunks.append(text))
+
+        self.assertEqual(chunks, ["半句"])
 
     def test_trace_store_writes_jsonl_when_directory_enabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:

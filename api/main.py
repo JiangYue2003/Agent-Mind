@@ -6,6 +6,7 @@ EchoMind 智能客服系统 — FastAPI 入口
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -13,7 +14,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Dict, List, Optional
 
 # 将项目根目录加入 sys.path，确保无论从哪里执行都能找到 agents/core/memory 等模块
@@ -26,6 +27,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -430,6 +432,10 @@ class ChatResponse(BaseModel):
     trace_id:    str = ""
 
 
+def _sse_event(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
 def _require_skill_admin(token: Optional[str]) -> None:
     expected = os.getenv("SKILL_ADMIN_TOKEN", "").strip()
     if not expected:
@@ -705,6 +711,275 @@ async def chat(req: ChatRequest):
         latency_ms=round(response_latency_ms, 1),
         knowledge_used=knowledge_used,
         trace_id=trace.trace_id,
+    )
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    if _orchestrator is None or _memory is None:
+        raise HTTPException(503, "服务未就绪")
+
+    from agents.agent_orchestrator import Request as OrcReq
+    from agents.agent_orchestrator import AgentType
+    from memory.conversation_memory import MsgRole
+    from telemetry.runtime import TraceContext
+    from workflow.state_machine import WorkflowState
+
+    async def _event_stream():
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+        async def _emit(event: str, payload: Dict[str, Any]) -> None:
+            await queue.put(_sse_event(event, payload))
+
+        async def _worker() -> None:
+            conv_id = req.conv_id or str(uuid.uuid4())
+            trace = TraceContext(user_id=req.user_id, conv_id=conv_id, message=req.message)
+            trace_store = _ensure_trace_store()
+            response_text = ""
+            response_agent_type = AgentType.GENERAL
+            response_intent = None
+            response_escalated = False
+            knowledge_used = False
+            response_latency_ms = 0.0
+            skill_snapshot = _skill_runtime.snapshot if _skill_runtime is not None else None
+            t0 = time.monotonic()
+            stage_seq = 0
+
+            async def _start_stage(stage: str, label: str) -> int:
+                nonlocal stage_seq
+                stage_seq += 1
+                seq = stage_seq
+                await _emit("stage", {
+                    "type": "stage.started",
+                    "stage": stage,
+                    "label": label,
+                    "seq": seq,
+                })
+                return seq
+
+            async def _complete_stage(stage: str, seq: int) -> None:
+                await _emit("stage", {
+                    "type": "stage.completed",
+                    "stage": stage,
+                    "seq": seq,
+                })
+
+            try:
+                await _emit("run", {
+                    "type": "run.started",
+                    "conversation_id": conv_id,
+                    "request_id": trace.trace_id,
+                })
+
+                with trace.stage("chat.total"):
+                    understanding_seq = await _start_stage("understanding", "正在理解问题")
+                    with trace.stage("memory.read"):
+                        mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
+
+                    history = [
+                        {"role": m.role.value, "content": m.content}
+                        for m in mem_ctx.recent_messages[-5:]
+                    ] if mem_ctx.recent_messages else None
+
+                    with trace.stage("intent.recognize"):
+                        intent_result = await _recognize_chat_intent(req.message, history)
+                    await _complete_stage("understanding", understanding_seq)
+
+                    planning_seq = await _start_stage("planning", "正在规划处理流程")
+                    workflow_decision = None
+                    if not _should_handoff(req.message, intent_result):
+                        with trace.stage("workflow.decide"):
+                            workflow_decision = await _decide_workflow(
+                                req.message,
+                                intent_result,
+                                history,
+                            )
+                            if workflow_decision is not None:
+                                trace._stages[-1].meta["decision"] = workflow_decision.to_dict()
+
+                    entities = _entities_with_resolved_order_id(intent_result, workflow_decision)
+                    if intent_result is not None and entities is not getattr(intent_result, "entities", None):
+                        intent_result.entities = entities
+
+                    with trace.stage("workflow.slot_check"):
+                        slot_assessment = _get_slot_manager().assess(
+                            message=req.message,
+                            intent=intent_result.intent if intent_result else None,
+                            entities=entities,
+                            decision=workflow_decision,
+                        )
+                        trace._stages[-1].meta["slot_check"] = slot_assessment.to_dict()
+
+                    with trace.stage("workflow.planner"):
+                        action_plan = _get_action_planner().plan(
+                            message=req.message,
+                            intent=intent_result.intent if intent_result else None,
+                            entities=entities,
+                            slot_assessment=slot_assessment,
+                            intent_confidence=getattr(intent_result, "confidence", 0.0) if intent_result else 0.0,
+                            intent_reasoning=getattr(intent_result, "reasoning", "") if intent_result else "",
+                            decision=workflow_decision,
+                        )
+                        trace._stages[-1].meta["plan"] = action_plan.to_dict()
+
+                    with trace.stage("workflow.state_transition"):
+                        workflow_path = _get_state_machine().build_path(action_plan)
+                        trace._stages[-1].meta["path"] = workflow_path.to_dict()
+                    await _complete_stage("planning", planning_seq)
+
+                    response_intent = intent_result.intent if intent_result else None
+                    response_agent_type = _agent_type_for_intent(response_intent, action_plan)
+                    response_escalated = action_plan.need_handoff
+
+                    if workflow_path.includes(WorkflowState.CLARIFY):
+                        answering_seq = await _start_stage("answering", "正在生成回答")
+                        response_text = action_plan.clarify_prompt or slot_assessment.clarify_question or "为了继续帮你处理，请补充关键信息。"
+                        await _complete_stage("answering", answering_seq)
+                    else:
+                        context_parts = [_final_answer_memory_context(mem_ctx)]
+                        should_emit_retrieving = bool(
+                            getattr(action_plan, "need_knowledge", False)
+                            or getattr(action_plan, "need_action_tool", False)
+                            or getattr(action_plan, "need_handoff", False)
+                        )
+                        retrieving_seq = 0
+                        if should_emit_retrieving:
+                            retrieving_seq = await _start_stage("retrieving", "正在查询相关信息")
+                        execution_result = await _execute_workflow_plan(
+                            action_plan,
+                            req,
+                            conv_id,
+                            mem_ctx,
+                            intent_result,
+                            trace=trace,
+                        )
+                        if should_emit_retrieving:
+                            await _complete_stage("retrieving", retrieving_seq)
+                        knowledge_used = execution_result.knowledge_used
+                        if execution_result.context_blocks:
+                            context_parts.extend(execution_result.context_blocks)
+
+                        if execution_result.handoff_required:
+                            failure_handoff_key = _make_idempotency_key(
+                                operation="failure_handoff",
+                                command_id=str(req.operation_id or conv_id),
+                                user_id=req.user_id,
+                                resource_id=conv_id,
+                            )
+                            handoff_result = await _maybe_handoff(
+                                req,
+                                conv_id,
+                                mem_ctx,
+                                intent_result,
+                                None,
+                                force=True,
+                                trace=trace,
+                                idempotency_key=failure_handoff_key,
+                            )
+                            response_escalated = True
+                            if handoff_result and str(handoff_result.get("status", "")).lower() != "failed":
+                                context_parts.append(_format_handoff_context(handoff_result))
+                            else:
+                                context_parts.append(
+                                    "[工作流执行状态]\n"
+                                    "- 退款请求的最终状态暂时无法确认，请不要重复提交。"
+                                )
+
+                        answering_seq = await _start_stage("answering", "正在生成回答")
+                        if execution_result.user_input_required:
+                            response_text = "当前操作状态暂时无法确认，请不要重复提交；请稍后重试或联系人工客服。"
+                            response_escalated = response_escalated or action_plan.need_handoff
+                            response_latency_ms = (time.monotonic() - t0) * 1000
+                        else:
+                            full_context = "\n\n".join(part for part in context_parts if part)
+
+                            orch_req = OrcReq(
+                                message=req.message,
+                                user_id=req.user_id,
+                                conv_id=conv_id,
+                                context=full_context,
+                                history=history,
+                                intent=intent_result.intent if intent_result else None,
+                                urgency=intent_result.urgency if intent_result else None,
+                            )
+
+                            with trace.stage("orchestrator.run"):
+                                result = await _stream_planned_orchestrator(
+                                    orch_req,
+                                    action_plan,
+                                    on_delta=lambda text: _emit("answer", {"type": "answer.delta", "delta": text}),
+                                    trace=trace,
+                                    skill_snapshot=skill_snapshot,
+                                )
+                            response_text = result.response
+                            if action_plan.follow_up_prompt:
+                                suffix = f"\n\n{action_plan.follow_up_prompt}"
+                                response_text = f"{response_text.rstrip()}{suffix}"
+                                await _emit("answer", {"type": "answer.delta", "delta": suffix})
+                            if not action_plan.need_handoff:
+                                response_agent_type = result.agent_type
+                            response_intent = result.intent
+                            response_escalated = response_escalated or result.escalated or action_plan.need_handoff
+                            response_latency_ms = result.latency_ms
+                        await _complete_stage("answering", answering_seq)
+
+                    with trace.stage("memory.write"):
+                        await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
+                        await _memory.add_message(req.user_id, conv_id, MsgRole.ASSISTANT, response_text)
+
+                    with trace.stage("profile_update.schedule"):
+                        asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
+
+                trace.finalize(success=True)
+                trace_store.save(trace)
+                if response_latency_ms <= 0:
+                    response_latency_ms = (time.monotonic() - t0) * 1000
+                await _emit("answer", {
+                    "type": "answer.completed",
+                    "response": response_text,
+                    "intent": response_intent.value if response_intent else "other",
+                    "agent_type": response_agent_type.value,
+                    "escalated": response_escalated,
+                    "knowledge_used": knowledge_used,
+                })
+                await _emit("run", {
+                    "type": "run.completed",
+                    "conversation_id": conv_id,
+                    "latency_ms": round(response_latency_ms, 1),
+                    "trace_id": trace.trace_id,
+                })
+            except Exception as ex:
+                trace.finalize(success=False, error=str(ex))
+                trace_store.save(trace)
+                logger.exception("chat stream failed")
+                await _emit("error", {
+                    "type": "error",
+                    "message": "服务暂时不可用，请稍后重试。",
+                    "retryable": False,
+                })
+            finally:
+                await queue.put(None)
+
+        worker = asyncio.create_task(_worker())
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            if not worker.done():
+                worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -1108,6 +1383,136 @@ async def _run_planned_orchestrator(
     else:
         with trace.stage("orchestrator.primary_summarize", primary_agent=primary_agent_type.value):
             primary_response = await _orchestrator._execute(primary_req, primary_agent_type, context=context)
+
+    escalated = escalated or bool(getattr(primary_response, "escalate", False))
+    return OrchestratorResult(
+        request_id=primary_req.request_id,
+        response=primary_response.content,
+        agent_type=primary_response.agent_type,
+        intent=primary_req.intent,
+        escalated=escalated,
+        latency_ms=(time.monotonic() - overall_t0) * 1000,
+    )
+
+
+async def _stream_planned_orchestrator(
+    orch_req: Any,
+    plan: Any,
+    on_delta,
+    trace: Any = None,
+    skill_snapshot: Any = None,
+):
+    from agents.agent_orchestrator import OrchestratorResult, Request as OrcReq
+
+    route_plan = getattr(plan, "route_plan", None)
+    skills_by_role = _build_agent_skills_context(skill_snapshot, plan, orch_req.intent)
+    if trace is not None and trace._stages:
+        trace._stages[-1].meta["skill_snapshot_generation"] = getattr(skill_snapshot, "generation", 0)
+        trace._stages[-1].meta["skill_ids_by_role"] = {
+            role: [str(skill.get("id", "")) for skill in skills]
+            for role, skills in skills_by_role.items()
+        }
+    execution_context: Dict[str, Any] = {}
+    if trace is not None:
+        execution_context["trace"] = trace
+    if skills_by_role:
+        execution_context["agent_skills_by_role"] = skills_by_role
+    context = execution_context or None
+    if _orchestrator is None or route_plan is None:
+        return await _orchestrator.stream(orch_req, on_delta, context=context)
+
+    if not getattr(route_plan, "supporting_agents", []):
+        primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
+        overall_t0 = time.monotonic()
+        if trace is None:
+            primary_response = await _orchestrator._execute_streaming(orch_req, primary_agent_type, on_delta, context=context)
+        else:
+            with trace.stage("orchestrator.execute", agent_type=primary_agent_type.value):
+                primary_response = await _orchestrator._execute_streaming(
+                    orch_req,
+                    primary_agent_type,
+                    on_delta,
+                    context=context,
+                )
+
+        escalated = bool(getattr(primary_response, "escalate", False))
+        return OrchestratorResult(
+            request_id=orch_req.request_id,
+            response=primary_response.content,
+            agent_type=primary_response.agent_type,
+            intent=orch_req.intent,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - overall_t0) * 1000,
+        )
+
+    overall_t0 = time.monotonic()
+    supporting_agent_types = [_agent_type_from_role(agent) for agent in route_plan.supporting_agents]
+    if getattr(route_plan, "merge_mode", None) and getattr(route_plan.merge_mode, "value", "") == "parallel_sections":
+        buffered = await _orchestrator.run_parallel(
+            orch_req,
+            [_agent_type_from_role(route_plan.primary_agent)] + supporting_agent_types,
+            context=context,
+        )
+        await on_delta(buffered.response)
+        return OrchestratorResult(
+            request_id=buffered.request_id,
+            response=buffered.response,
+            agent_type=buffered.agent_type,
+            intent=buffered.intent,
+            escalated=buffered.escalated,
+            latency_ms=(time.monotonic() - overall_t0) * 1000,
+        )
+
+    primary_agent_type = _agent_type_from_role(getattr(route_plan, "final_writer", None) or route_plan.primary_agent)
+    support_blocks = []
+    escalated = False
+    if trace is None:
+        support_results = await asyncio.gather(
+            *[
+                _orchestrator._execute(_build_supporting_agent_request(orch_req, agent_type), agent_type, context=context)
+                for agent_type in supporting_agent_types
+            ],
+            return_exceptions=True,
+        )
+    else:
+        with trace.stage("orchestrator.supporting_agents"):
+            support_results = await asyncio.gather(
+                *[
+                    _orchestrator._execute(
+                        _build_supporting_agent_request(orch_req, agent_type),
+                        agent_type,
+                        context=context,
+                    )
+                    for agent_type in supporting_agent_types
+                ],
+                return_exceptions=True,
+            )
+    for result in support_results:
+        if isinstance(result, Exception) or not getattr(result, "success", False):
+            continue
+        support_blocks.append(f"[{result.agent_type.value} 结构化意见]\n{result.content}")
+        escalated = escalated or bool(getattr(result, "escalate", False))
+
+    primary_context = orch_req.context
+    if support_blocks:
+        primary_context = "\n\n".join([orch_req.context, "[辅助专家结构化意见]", *support_blocks])
+
+    primary_req = OrcReq(
+        message=orch_req.message,
+        user_id=orch_req.user_id,
+        conv_id=orch_req.conv_id,
+        context=primary_context,
+        history=orch_req.history,
+        intent=orch_req.intent,
+        urgency=orch_req.urgency,
+        request_id=orch_req.request_id,
+    )
+
+    if trace is None:
+        primary_response = await _orchestrator._execute_streaming(primary_req, primary_agent_type, on_delta, context=context)
+    else:
+        with trace.stage("orchestrator.primary_summarize", primary_agent=primary_agent_type.value):
+            primary_response = await _orchestrator._execute_streaming(primary_req, primary_agent_type, on_delta, context=context)
 
     escalated = escalated or bool(getattr(primary_response, "escalate", False))
     return OrchestratorResult(

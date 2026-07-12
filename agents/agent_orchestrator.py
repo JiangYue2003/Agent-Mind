@@ -16,6 +16,7 @@
   - Agent 置信度低于阈值 → 自动升级到更高级 Agent 或转人工
 """
 import asyncio
+import inspect
 import logging
 import time
 import uuid
@@ -145,6 +146,33 @@ class BaseAgent:
                 latency_ms=ms,
             )
 
+    async def handle_stream(
+        self,
+        req: Request,
+        on_delta,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
+        t0 = time.monotonic()
+        self.stats.total += 1
+        try:
+            content = await self._call_llm_stream(req, on_delta, context=context)
+            ms = (time.monotonic() - t0) * 1000
+            self.stats.success += 1
+            self.stats.total_ms += ms
+            escalate = self._needs_escalation(content)
+            return AgentResponse(
+                agent_type=self.agent_type,
+                content=content,
+                success=True,
+                latency_ms=ms,
+                escalate=escalate,
+            )
+        except Exception as ex:
+            ms = (time.monotonic() - t0) * 1000
+            self.stats.total_ms += ms
+            logger.error(f"{self.agent_type.value} 流式处理失败: {ex}")
+            raise
+
     async def _call_llm(self, req: Request, context: Optional[Dict[str, Any]] = None) -> str:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
@@ -180,6 +208,55 @@ class BaseAgent:
                 if usage:
                     trace._stages[-1].meta["usage"] = usage
         return resp.content[0].text
+
+    async def _call_llm_stream(self, req: Request, on_delta, context: Optional[Dict[str, Any]] = None) -> str:
+        def _clean(s: str) -> str:
+            return s.encode("utf-8", errors="ignore").decode("utf-8")
+
+        async def _forward_delta(text: str) -> None:
+            result = on_delta(text)
+            if inspect.isawaitable(result):
+                await result
+
+        messages = []
+        if req.context:
+            messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
+            messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
+        messages.append({"role": "user", "content": _clean(req.message)})
+
+        trace = (context or {}).get("trace")
+        system_prompt = self._system_prompt_for(context)
+        parts: List[str] = []
+        if trace is None:
+            async with self._client.messages.stream(
+                model=self._model,
+                max_tokens=450,
+                system=system_prompt,
+                messages=messages,
+            ) as stream:
+                async for text in stream.text_stream:
+                    if not text:
+                        continue
+                    parts.append(text)
+                    await _forward_delta(text)
+        else:
+            with trace.stage(f"agent.llm_stream.{self.agent_type.value}", model=self._model):
+                async with self._client.messages.stream(
+                    model=self._model,
+                    max_tokens=450,
+                    system=system_prompt,
+                    messages=messages,
+                ) as stream:
+                    async for text in stream.text_stream:
+                        if not text:
+                            continue
+                        parts.append(text)
+                        await _forward_delta(text)
+                    final_message = await stream.get_final_message()
+                usage = _extract_usage_dict(final_message)
+                if usage:
+                    trace._stages[-1].meta["usage"] = usage
+        return "".join(parts)
 
     def _system_prompt_for(self, context: Optional[Dict[str, Any]]) -> str:
         skills = (context or {}).get("agent_skills", [])
@@ -437,6 +514,113 @@ class AgentOrchestrator:
             response = await fallback.handle(req, context=self._context_for_agent(context, AgentType.GENERAL))
 
         return response
+
+    async def _execute_streaming(
+        self,
+        req: Request,
+        agent_type: AgentType,
+        on_delta,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> AgentResponse:
+        agent = self._best_agent(agent_type)
+        if agent is None:
+            agent = self._best_agent(AgentType.GENERAL)
+        if agent is None:
+            return AgentResponse(
+                agent_type=AgentType.GENERAL,
+                content="服务暂时不可用，请稍后重试。",
+                success=False,
+            )
+
+        emitted_any = False
+
+        async def _wrapped_delta(text: str) -> None:
+            nonlocal emitted_any
+            emitted_any = True
+            result = on_delta(text)
+            if inspect.isawaitable(result):
+                await result
+
+        try:
+            response = await agent.handle_stream(req, _wrapped_delta, context=self._context_for_agent(context, agent_type))
+        except Exception:
+            if agent_type != AgentType.GENERAL and not emitted_any:
+                logger.warning(f"{agent_type.value} 流式处理失败，降级到 GeneralAgent")
+                fallback = self._best_agent(AgentType.GENERAL)
+                if fallback is not None:
+                    return await fallback.handle_stream(req, _wrapped_delta, context=self._context_for_agent(context, AgentType.GENERAL))
+            raise
+
+        fallback = None
+        if not response.success and agent_type != AgentType.GENERAL and not emitted_any:
+            logger.warning(f"{agent_type.value} 流式处理失败，降级到 GeneralAgent")
+            fallback = self._best_agent(AgentType.GENERAL)
+        if fallback:
+            response = await fallback.handle_stream(req, _wrapped_delta, context=self._context_for_agent(context, AgentType.GENERAL))
+
+        return response
+
+    async def stream(
+        self,
+        req: Request,
+        on_delta,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> OrchestratorResult:
+        t0 = time.monotonic()
+        trace = (context or {}).get("trace")
+
+        if req.intent is None:
+            if trace is None:
+                intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            else:
+                with trace.stage("orchestrator.intent_recognize"):
+                    intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
+            req.intent = intent_result.intent
+            req.urgency = intent_result.urgency
+
+        collaboration = self._collaboration_targets(req)
+        if len(collaboration) > 1:
+            buffered = await self.run_parallel(req, collaboration, context=context)
+            result = on_delta(buffered.response)
+            if inspect.isawaitable(result):
+                await result
+            return OrchestratorResult(
+                request_id=buffered.request_id,
+                response=buffered.response,
+                agent_type=buffered.agent_type,
+                intent=buffered.intent,
+                escalated=buffered.escalated,
+                latency_ms=(time.monotonic() - t0) * 1000,
+            )
+
+        if trace is None:
+            agent_type = self._route(req.intent, req.urgency)
+            response = await self._execute_streaming(req, agent_type, on_delta, context=context)
+        else:
+            with trace.stage("orchestrator.route"):
+                agent_type = self._route(req.intent, req.urgency)
+            with trace.stage("orchestrator.execute", agent_type=agent_type.value):
+                response = await self._execute_streaming(req, agent_type, on_delta, context=context)
+
+        escalated = False
+        if trace is None:
+            if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
+                escalated = True
+                logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+        else:
+            with trace.stage("orchestrator.escalation_check"):
+                if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent == IntentCategory.ESCALATION:
+                    escalated = True
+                    logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+
+        return OrchestratorResult(
+            request_id=req.request_id,
+            response=response.content,
+            agent_type=response.agent_type,
+            intent=req.intent,
+            escalated=escalated,
+            latency_ms=(time.monotonic() - t0) * 1000,
+        )
 
     @staticmethod
     def _context_for_agent(
