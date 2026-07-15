@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import AsyncAnthropic
 
 from core.resilience import call_llm
-from core.intent_recognizer import IntentCategory
+from core.intent_recognizer import IntentCategory, IntentDomain, SpeechAct
 from workflow.tool_schema import required_slots_for_tools
 
 logger = logging.getLogger(__name__)
@@ -87,9 +87,11 @@ class WorkflowIntentDecider:
         intent: Optional[IntentCategory],
         entities: Optional[Dict[str, List[str]]],
         history: Optional[List[Dict[str, str]]],
+        speech_act: Optional[SpeechAct] = None,
+        domain: Optional[IntentDomain] = None,
     ) -> WorkflowDecision:
         order_id = self._resolve_order_id(entities, history)
-        prompt = self._build_prompt(message, intent, order_id, history)
+        prompt = self._build_prompt(message, intent, order_id, history, speech_act, domain)
         try:
             response = await call_llm(
                 lambda: self.client.messages.create(
@@ -112,6 +114,8 @@ class WorkflowIntentDecider:
         intent: Optional[IntentCategory],
         order_id: str,
         history: Optional[List[Dict[str, str]]],
+        speech_act: Optional[SpeechAct],
+        domain: Optional[IntentDomain],
     ) -> str:
         recent_history = "\n".join(
             f"{item.get('role', 'user')}: {item.get('content', '')}"
@@ -120,6 +124,8 @@ class WorkflowIntentDecider:
         return f"""你是客服工作流决策器。判断回答当前问题所需的最小证据，不能只根据关键词猜测工具。
 
 粗粒度意图: {getattr(intent, 'value', 'other')}
+行为轴: {getattr(speech_act, 'value', 'unknown')}
+领域轴: {getattr(domain, 'value', 'unknown')}
 当前可用订单号: {order_id or '无'}
 最近对话:
 {recent_history}
@@ -132,6 +138,7 @@ class WorkflowIntentDecider:
 - refund_create: 为某一笔订单提交退款申请；需要订单号。
 
 决策规则:
+- 行为轴和领域轴是辅助语义证据；当前问题、历史和订单号仍是最终依据。
 - goal 表示用户想解决的问题类型，不表示订单号是否已经给出。缺订单号时，仍必须保留用户需要的实时查询或执行工具，后续由槽位机制追问。
 - 规则、资格、时效、正常性、处理阈值和流程选择 goal=knowledge、tools=["knowledge_search"]。
 - 用户想查询自己订单的当前状态或当前物流，选择 goal=live_record 和对应实时工具；即使未给订单号也不能改成 knowledge。

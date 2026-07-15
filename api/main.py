@@ -6,6 +6,7 @@ EchoMind 智能客服系统 — FastAPI 入口
 """
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -1098,12 +1099,16 @@ async def _decide_workflow(message: str, intent_result: Any, history: Optional[L
     if decider is None:
         return None
     try:
-        return await decider.decide(
-            message=message,
-            intent=getattr(intent_result, "intent", None),
-            entities=getattr(intent_result, "entities", {}) if intent_result else {},
-            history=history,
-        )
+        kwargs = {
+            "message": message,
+            "intent": getattr(intent_result, "intent", None),
+            "entities": getattr(intent_result, "entities", {}) if intent_result else {},
+            "history": history,
+        }
+        if "speech_act" in inspect.signature(decider.decide).parameters:
+            kwargs["speech_act"] = getattr(intent_result, "speech_act", None)
+            kwargs["domain"] = getattr(intent_result, "domain", None)
+        return await decider.decide(**kwargs)
     except Exception as ex:
         logger.warning(f"workflow 语义决策失败: {ex}")
         return None

@@ -1,0 +1,24 @@
+{"case_id":"intent-query-001","user_input":"退款审核通过后多久到账？","expected_intent":"query","expected_urgency":"low","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-query-004","user_input":"优惠券和积分退款后会退回来吗？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"medium"}
+{"case_id":"intent-complaint-003","user_input":"你们的退款流程也太慢了吧。","expected_intent":"complaint","expected_urgency":"medium","category":"boundary","difficulty":"medium"}
+{"case_id":"intent-request-002","user_input":"请帮我把收货地址改成公司。","expected_intent":"request","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-002","user_input":"嗨，在吗？","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-escalation-003","user_input":"我要正式投诉并要求人工跟进。","expected_intent":"escalation","expected_urgency":"high","category":"boundary","difficulty":"medium"}
+{"case_id":"intent-technical-002","user_input":"登录时一直报 500 错误。","expected_intent":"technical","category":"direct","difficulty":"easy"}
+{"case_id":"intent-technical-007","user_input":"上传发票总是失败，错误码 E403。","expected_intent":"technical","expected_entities":{"error_code":["E403"]},"category":"direct","difficulty":"medium"}
+{"case_id":"intent-billing-002","user_input":"我要申请退款。","expected_intent":"request","expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":true,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-billing-004","user_input":"订单 ORD20260714001 我要退款。","expected_intent":"request","expected_entities":{"order_id":["ORD20260714001"]},"expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-billing-006","user_input":"付款失败但银行卡显示已经扣钱。","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"hard"}
+{"case_id":"intent-account-003","user_input":"密码忘记了，怎么重置？","expected_intent":"account","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-account-007","user_input":"账号被锁定了怎么办？","expected_intent":"account","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"medium"}
+{"case_id":"intent-feedback-004","user_input":"问题已经解决，辛苦了。","expected_intent":"feedback","category":"paraphrase","difficulty":"easy"}
+{"case_id":"intent-other-003","user_input":"你觉得哪只股票明天会涨？","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-007","user_input":"写一段 Python 排序代码。","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-multiturn-001","user_input":"现在到哪了？","history":[{"role":"user","content":"请帮我查订单 ORD20260714011 的物流"},{"role":"assistant","content":"已找到订单 ORD20260714011。"}],"expected_intent":"query","expected_workflow_mode":"live_record","expected_tools":["shipment_track"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}
+{"case_id":"intent-multiturn-002","user_input":"那就帮我退掉吧。","history":[{"role":"user","content":"我要处理订单 ORD20260714012"},{"role":"assistant","content":"订单 ORD20260714012 已签收。"}],"expected_intent":"request","expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}
+{"case_id":"intent-complaint-006","user_input":"同样的问题问了两遍还是没解决，太失望了。","expected_intent":"complaint","expected_urgency":"medium","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-request-004","user_input":"可以帮我合并这两个订单吗？","expected_intent":"request","category":"direct","difficulty":"medium"}
+{"case_id":"intent-greeting-007","user_input":"请问有人在线吗？","expected_intent":"greeting","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-escalation-007","user_input":"再不给答复我就找消费者协会。","expected_intent":"escalation","expected_urgency":"high","category":"boundary","difficulty":"hard"}
+{"case_id":"intent-technical-005","user_input":"系统提示网络异常但我的网络正常。","expected_intent":"technical","category":"direct","difficulty":"medium"}
+{"case_id":"intent-account-006","user_input":"我不想再收到营销邮件了。","expected_intent":"request","category":"paraphrase","difficulty":"medium"}

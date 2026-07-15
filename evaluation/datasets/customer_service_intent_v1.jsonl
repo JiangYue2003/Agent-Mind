@@ -1,0 +1,84 @@
+{"case_id":"intent-query-001","user_input":"退款审核通过后多久到账？","expected_intent":"query","expected_urgency":"low","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-query-002","user_input":"商品签收后还能申请退货吗？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-query-003","user_input":"如何开电子发票？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-query-004","user_input":"优惠券和积分退款后会退回来吗？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"medium"}
+{"case_id":"intent-query-005","user_input":"修改收货地址有什么限制？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-query-006","user_input":"付款成功后一般多久发货？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"paraphrase","difficulty":"easy"}
+{"case_id":"intent-query-007","user_input":"验证码收不到要怎么处理？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-query-008","user_input":"发票抬头可以改成公司名称吗？","expected_intent":"query","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-complaint-001","user_input":"客服三天都没有回复，体验太差了。","expected_intent":"complaint","expected_urgency":"medium","category":"direct","difficulty":"easy"}
+{"case_id":"intent-complaint-002","user_input":"包裹晚了这么久，也没人解释。","expected_intent":"complaint","expected_urgency":"medium","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-complaint-003","user_input":"你们的退款流程也太慢了吧。","expected_intent":"complaint","expected_urgency":"medium","category":"boundary","difficulty":"medium"}
+{"case_id":"intent-complaint-004","user_input":"页面一直提示失败，服务质量不行。","expected_intent":"complaint","expected_urgency":"medium","category":"boundary","difficulty":"hard"}
+{"case_id":"intent-complaint-005","user_input":"等了一个小时还没有人处理我的问题。","expected_intent":"complaint","expected_urgency":"medium","category":"direct","difficulty":"easy"}
+{"case_id":"intent-complaint-006","user_input":"同样的问题问了两遍还是没解决，太失望了。","expected_intent":"complaint","expected_urgency":"medium","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-complaint-007","user_input":"配送承诺根本没有做到。","expected_intent":"complaint","expected_urgency":"medium","category":"direct","difficulty":"medium"}
+{"case_id":"intent-complaint-008","user_input":"这个处理结果我完全不能接受。","expected_intent":"complaint","expected_urgency":"medium","category":"direct","difficulty":"medium"}
+{"case_id":"intent-request-001","user_input":"帮我取消刚下的订单。","expected_intent":"request","category":"direct","difficulty":"easy"}
+{"case_id":"intent-request-002","user_input":"请帮我把收货地址改成公司。","expected_intent":"request","category":"direct","difficulty":"easy"}
+{"case_id":"intent-request-003","user_input":"麻烦重新发送一下登录验证码。","expected_intent":"request","category":"direct","difficulty":"easy"}
+{"case_id":"intent-request-004","user_input":"可以帮我合并这两个订单吗？","expected_intent":"request","category":"direct","difficulty":"medium"}
+{"case_id":"intent-request-005","user_input":"帮忙取消发票申请。","expected_intent":"request","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-request-006","user_input":"我要把订单里的商品数量改一下。","expected_intent":"request","category":"direct","difficulty":"medium"}
+{"case_id":"intent-request-007","user_input":"请协助我修改配送时间。","expected_intent":"request","category":"direct","difficulty":"medium"}
+{"case_id":"intent-request-008","user_input":"能不能帮我关闭短信通知？","expected_intent":"request","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-greeting-001","user_input":"你好","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-002","user_input":"嗨，在吗？","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-003","user_input":"早上好","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-004","user_input":"hello","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-005","user_input":"有人能帮我吗","expected_intent":"greeting","category":"paraphrase","difficulty":"easy"}
+{"case_id":"intent-greeting-006","user_input":"客服你好呀","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-greeting-007","user_input":"请问有人在线吗？","expected_intent":"greeting","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-greeting-008","user_input":"晚安","expected_intent":"greeting","category":"direct","difficulty":"easy"}
+{"case_id":"intent-escalation-001","user_input":"我要转人工客服。","expected_intent":"escalation","expected_urgency":"high","category":"direct","difficulty":"easy"}
+{"case_id":"intent-escalation-002","user_input":"让你们经理来处理这件事。","expected_intent":"escalation","expected_urgency":"high","category":"direct","difficulty":"easy"}
+{"case_id":"intent-escalation-003","user_input":"我要正式投诉并要求人工跟进。","expected_intent":"escalation","expected_urgency":"high","category":"boundary","difficulty":"medium"}
+{"case_id":"intent-escalation-004","user_input":"别再机器人回复了，给我接人工。","expected_intent":"escalation","expected_urgency":"high","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-escalation-005","user_input":"请升级这个工单，今天必须有人解决。","expected_intent":"escalation","expected_urgency":"high","category":"direct","difficulty":"medium"}
+{"case_id":"intent-escalation-006","user_input":"我需要主管介入。","expected_intent":"escalation","expected_urgency":"high","category":"direct","difficulty":"easy"}
+{"case_id":"intent-escalation-007","user_input":"再不给答复我就找消费者协会。","expected_intent":"escalation","expected_urgency":"high","category":"boundary","difficulty":"hard"}
+{"case_id":"intent-escalation-008","user_input":"把问题转给能负责的人。","expected_intent":"escalation","expected_urgency":"high","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-technical-001","user_input":"应用打开就闪退。","expected_intent":"technical","category":"direct","difficulty":"easy"}
+{"case_id":"intent-technical-002","user_input":"登录时一直报 500 错误。","expected_intent":"technical","category":"direct","difficulty":"easy"}
+{"case_id":"intent-technical-003","user_input":"支付页面加载不出来。","expected_intent":"technical","category":"direct","difficulty":"medium"}
+{"case_id":"intent-technical-004","user_input":"点击提交后页面卡住不动。","expected_intent":"technical","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-technical-005","user_input":"系统提示网络异常但我的网络正常。","expected_intent":"technical","category":"direct","difficulty":"medium"}
+{"case_id":"intent-technical-006","user_input":"更新 App 后无法打开订单详情。","expected_intent":"technical","category":"direct","difficulty":"medium"}
+{"case_id":"intent-technical-007","user_input":"上传发票总是失败，错误码 E403。","expected_intent":"technical","expected_entities":{"error_code":["E403"]},"category":"direct","difficulty":"medium"}
+{"case_id":"intent-technical-008","user_input":"网页结算按钮点了没有任何反应。","expected_intent":"technical","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-billing-001","user_input":"为什么同一笔订单扣了两次款？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-billing-002","user_input":"我要申请退款。","expected_intent":"request","expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":true,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-billing-003","user_input":"退款到账怎么还没到账？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"medium"}
+{"case_id":"intent-billing-004","user_input":"订单 ORD20260714001 我要退款。","expected_intent":"request","expected_entities":{"order_id":["ORD20260714001"]},"expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-billing-005","user_input":"电子发票可以提现吗？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-billing-006","user_input":"付款失败但银行卡显示已经扣钱。","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"hard"}
+{"case_id":"intent-billing-007","user_input":"退款金额少了 20 元，是什么原因？","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-billing-008","user_input":"我想知道本月的扣费明细。","expected_intent":"billing","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"medium"}
+{"case_id":"intent-account-001","user_input":"怎么修改绑定邮箱？","expected_intent":"account","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-account-002","user_input":"我要注销这个账号。","expected_intent":"account","category":"direct","difficulty":"easy"}
+{"case_id":"intent-account-003","user_input":"密码忘记了，怎么重置？","expected_intent":"account","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"direct","difficulty":"easy"}
+{"case_id":"intent-account-004","user_input":"手机号换了，原来的账号怎么登录？","expected_intent":"account","category":"direct","difficulty":"medium"}
+{"case_id":"intent-account-005","user_input":"帮我更新个人资料里的姓名。","expected_intent":"account","category":"direct","difficulty":"easy"}
+{"case_id":"intent-account-006","user_input":"我不想再收到营销邮件了。","expected_intent":"request","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-account-007","user_input":"账号被锁定了怎么办？","expected_intent":"account","expected_workflow_mode":"knowledge","expected_tools":["knowledge_search"],"expected_should_clarify":false,"category":"boundary","difficulty":"medium"}
+{"case_id":"intent-account-008","user_input":"如何删除保存的收货地址？","expected_intent":"account","category":"direct","difficulty":"medium"}
+{"case_id":"intent-feedback-001","user_input":"客服解释得很清楚，谢谢。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-feedback-002","user_input":"这次退款处理得很快，给好评。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-feedback-003","user_input":"你们的配送服务很棒。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-feedback-004","user_input":"问题已经解决，辛苦了。","expected_intent":"feedback","category":"paraphrase","difficulty":"easy"}
+{"case_id":"intent-feedback-005","user_input":"非常满意这次的处理。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-feedback-006","user_input":"谢谢，按你说的操作成功了。","expected_intent":"feedback","category":"paraphrase","difficulty":"medium"}
+{"case_id":"intent-feedback-007","user_input":"给客服点个赞。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-feedback-008","user_input":"效率很高，感谢帮忙。","expected_intent":"feedback","category":"direct","difficulty":"easy"}
+{"case_id":"intent-other-001","user_input":"今天天气怎么样？","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-002","user_input":"给我写一首关于夏天的诗。","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-003","user_input":"你觉得哪只股票明天会涨？","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-004","user_input":"帮我订一张去上海的机票。","expected_intent":"other","category":"ood","difficulty":"medium"}
+{"case_id":"intent-other-005","user_input":"如何做红烧肉？","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-006","user_input":"告诉我今天的国际新闻。","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-007","user_input":"写一段 Python 排序代码。","expected_intent":"other","category":"ood","difficulty":"easy"}
+{"case_id":"intent-other-008","user_input":"你能陪我聊聊天吗？","expected_intent":"other","category":"ood","difficulty":"medium"}
+{"case_id":"intent-multiturn-001","user_input":"现在到哪了？","history":[{"role":"user","content":"请帮我查订单 ORD20260714011 的物流"},{"role":"assistant","content":"已找到订单 ORD20260714011。"}],"expected_intent":"query","expected_workflow_mode":"live_record","expected_tools":["shipment_track"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}
+{"case_id":"intent-multiturn-002","user_input":"那就帮我退掉吧。","history":[{"role":"user","content":"我要处理订单 ORD20260714012"},{"role":"assistant","content":"订单 ORD20260714012 已签收。"}],"expected_intent":"request","expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}
+{"case_id":"intent-multiturn-003","user_input":"那笔订单现在是什么状态？","history":[{"role":"user","content":"我的订单号是 ORD20260714013"},{"role":"assistant","content":"已记录订单 ORD20260714013。"}],"expected_intent":"query","expected_workflow_mode":"live_record","expected_tools":["order_lookup"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}
+{"case_id":"intent-multiturn-004","user_input":"我还是想申请退款。","history":[{"role":"user","content":"订单 ORD20260714014 还没有发货"},{"role":"assistant","content":"订单 ORD20260714014 当前待发货。"}],"expected_intent":"billing","expected_workflow_mode":"action","expected_tools":["refund_create"],"expected_should_clarify":false,"category":"multi_turn","difficulty":"hard"}

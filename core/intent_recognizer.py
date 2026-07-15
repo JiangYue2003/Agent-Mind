@@ -62,6 +62,24 @@ class IntentCategory(Enum):
     OTHER      = "other"
 
 
+class SpeechAct(Enum):
+    INFORMATION = "information"
+    OPERATION = "operation"
+    COMPLAINT = "complaint"
+    ESCALATION = "escalation"
+    SOCIAL = "social"
+    OOD = "ood"
+
+
+class IntentDomain(Enum):
+    BILLING = "billing"
+    ACCOUNT = "account"
+    TECHNICAL = "technical"
+    ORDER = "order"
+    GENERAL = "general"
+    UNKNOWN = "unknown"
+
+
 class UrgencyLevel(Enum):
     LOW      = 1
     MEDIUM   = 2
@@ -72,6 +90,8 @@ class UrgencyLevel(Enum):
 @dataclass
 class IntentResult:
     intent:     IntentCategory
+    speech_act: SpeechAct
+    domain:     IntentDomain
     confidence: float
     urgency:    UrgencyLevel
     entities:   Dict[str, List[str]]   # 从消息中提取的实体
@@ -172,11 +192,17 @@ class IntentRecognizer:
             emb = {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
         intent = self._vote(llm, emb, pat)
+        speech_act = llm.get("speech_act")
+        domain = llm.get("domain")
+        if not isinstance(speech_act, SpeechAct) or not isinstance(domain, IntentDomain):
+            speech_act, domain = self._axes_from_legacy(intent)
         entities = await self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
         result = IntentResult(
             intent=intent,
+            speech_act=speech_act,
+            domain=domain,
             confidence=llm["confidence"],
             urgency=urgency,
             entities=entities,
@@ -231,8 +257,35 @@ class IntentRecognizer:
 {ctx}
 用户消息: "{message}"
 
+双轴标注规则:
+可选行为轴: information, operation, complaint, escalation, social, ood
+- information: 询问规则、资格、处理方式、实时状态或物流信息。“怎么做/怎么办/为何发生/状态如何”一律为 information，即使使用“帮我查/帮我处理”等礼貌语。
+- operation: 明确要求系统直接执行创建、取消、修改、提交退款等状态变更；只询问步骤、状态或解决办法不是 operation。
+- complaint: 表达明确不满，如“太慢、太差、不能接受”；仅描述技术故障不构成 complaint，未带明确不满时归 information。
+- escalation: 明确要求转人工、主管、升级处理或正式投诉。
+- social: 问候、致谢、好评等社交表达。
+- ood: 请求不属于客服可支持范围。
+
+可选领域轴: billing, account, technical, order, general, unknown
+- billing: 支付、扣款、退款、发票、金额。
+- account: 登录凭证、邮箱、手机号、资料、通知设置、账号状态。
+- technical: 应用、网页、接口、错误码、加载或功能故障。
+- order: 订单状态、物流、配送、收货地址、商品和售后履约。
+- general: 客服服务本身或没有明确业务领域的表达。
+- unknown: 域外请求；仅行为轴为 ood 时使用。
+
+先独立判断两个轴，不能因为是投诉、升级或好评就忽略具体领域；只有没有业务主题时才选择 general。
+双轴示例:
+- “我要申请退款” -> operation + billing
+- “订单现在是什么状态” -> information + order
+- “帮我查一下物流进度” -> information + order
+- “密码忘记了，怎么重置” -> information + account
+- “应用打开就闪退” -> information + technical
+- “退款太慢了” -> complaint + billing
+- “帮我订机票” -> ood + unknown
+
 返回格式（仅 JSON，不要其他文字）:
-{{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
+{{"intent": "<意图值>", "speech_act": "<行为轴>", "domain": "<领域轴>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
 
 可选意图: {", ".join(c.value for c in IntentCategory)}"""
         prompt = self._clean_text(prompt)
@@ -267,6 +320,14 @@ class IntentRecognizer:
                 data["intent"] = IntentCategory(data["intent"])
             except ValueError:
                 data["intent"] = IntentCategory.OTHER
+            try:
+                data["speech_act"] = SpeechAct(data.get("speech_act"))
+            except (TypeError, ValueError):
+                data["speech_act"] = None
+            try:
+                data["domain"] = IntentDomain(data.get("domain"))
+            except (TypeError, ValueError):
+                data["domain"] = None
             return data
         except Exception as ex:
             logger.warning(f"LLM 识别失败: {ex}")
@@ -334,6 +395,23 @@ class IntentRecognizer:
 
         best = max(scores, key=scores.get)  # type: ignore
         return best if scores[best] >= self.threshold else IntentCategory.OTHER
+
+    @staticmethod
+    def _axes_from_legacy(intent: IntentCategory) -> tuple[SpeechAct, IntentDomain]:
+        """Provide stable axes when the LLM response cannot supply them."""
+        mappings = {
+            IntentCategory.QUERY: (SpeechAct.INFORMATION, IntentDomain.GENERAL),
+            IntentCategory.COMPLAINT: (SpeechAct.COMPLAINT, IntentDomain.GENERAL),
+            IntentCategory.REQUEST: (SpeechAct.OPERATION, IntentDomain.GENERAL),
+            IntentCategory.GREETING: (SpeechAct.SOCIAL, IntentDomain.GENERAL),
+            IntentCategory.ESCALATION: (SpeechAct.ESCALATION, IntentDomain.GENERAL),
+            IntentCategory.TECHNICAL: (SpeechAct.INFORMATION, IntentDomain.TECHNICAL),
+            IntentCategory.BILLING: (SpeechAct.INFORMATION, IntentDomain.BILLING),
+            IntentCategory.ACCOUNT: (SpeechAct.INFORMATION, IntentDomain.ACCOUNT),
+            IntentCategory.FEEDBACK: (SpeechAct.SOCIAL, IntentDomain.GENERAL),
+            IntentCategory.OTHER: (SpeechAct.OOD, IntentDomain.UNKNOWN),
+        }
+        return mappings[intent]
 
     # ── 实体提取 ──────────────────────────────────────────────────────────────
 
